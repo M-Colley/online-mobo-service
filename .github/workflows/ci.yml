@@ -26,7 +26,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Compile all modules
-        run: python -m py_compile vam_space.py optimizer_core.py main.py simulate.py test_service.py test_vam_space.py inspect_db.py
+        run: python -m py_compile space.py optimizer_core.py main.py simulate.py test_service.py test_space.py inspect_db.py
 
       - name: Unit tests (search space)
         run: python tests/test_vam_space.py
