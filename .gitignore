@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# local secrets / deployment notes — never commit
+.env
+*.local.md
+
+# local artifacts
+*.zip
+firebase-debug.log

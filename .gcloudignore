@@ -1,0 +1,17 @@
+# Dev-only files — kept out of the Cloud Run container image
+README.md
+LICENSE
+CITATION.cff
+simulate.py
+test_service.py
+test_vam_space.py
+inspect_db.py
+Makefile
+tasks.ps1
+firebase/
+.github/
+.gitignore
+*.local.md
+__pycache__/
+*.pyc
+.gcloudignore

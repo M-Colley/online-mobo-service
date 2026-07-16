@@ -1,0 +1,21 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "interventionResults",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "pid", "order": "ASCENDING" },
+        { "fieldPath": "phaseStep", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "parameterValues",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "pid", "order": "ASCENDING" },
+        { "fieldPath": "phaseStep", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

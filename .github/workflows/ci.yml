@@ -1,0 +1,38 @@
+name: tests
+
+# Paths assume this folder IS the repository root (the standalone-repo layout).
+# While it still lives nested inside the study monorepo, GitHub ignores this
+# file; the monorepo's own workflow covers CI there.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies (CPU-only torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Compile all modules
+        run: python -m py_compile vam_space.py optimizer_core.py main.py simulate.py test_service.py test_vam_space.py inspect_db.py
+
+      - name: Unit tests (search space)
+        run: python tests/test_vam_space.py
+
+      - name: Optimizer simulation
+        run: python tests/simulate.py
+
+      - name: Full HTTP service test
+        run: python tests/test_service.py
