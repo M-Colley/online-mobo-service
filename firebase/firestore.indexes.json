@@ -15,6 +15,14 @@
         { "fieldPath": "pid", "order": "ASCENDING" },
         { "fieldPath": "phaseStep", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "parameterValues",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "pid", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

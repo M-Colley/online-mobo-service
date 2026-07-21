@@ -125,6 +125,7 @@ def choose_next(
     model = build_and_fit_model(X_model, Y)
     row = _optimise_acqf(model, X_model)
     raw = space.snap_candidate(row)
+    raw = space.project_feasible(raw)  # minimal repair, keeps the model's choice
 
     # The snapped optimum can coincide with a point already tested, or violate a
     # hard constraint. Fall back to the nearest fresh feasible on-grid config.

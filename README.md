@@ -202,12 +202,40 @@ action versions fresh monthly.
 
 ## Deploy
 
-Pick a Cloud Run **region co-located with your Firestore database** (e.g. a
-`nam5` database → `us-central1`) — Firestore triggers must run from a region
-compatible with the database's location.
+### Prerequisites (one time)
 
-Prereqs (one time): billing enabled, and the APIs `run`, `cloudbuild`,
-`artifactregistry`, `cloudfunctions`, `eventarc`, `firestore` enabled:
+| What | Why | How to check |
+|------|-----|--------------|
+| A GCP project with **billing enabled** | Cloud Run and Cloud Build refuse to run without it | Console → Billing: a billing account must be linked to the project |
+| IAM: **Owner**, or `Cloud Run Admin` + `Cloud Functions Admin` + `Service Account User` | deploy rights | Console → IAM & Admin → IAM → find your account's Role column |
+| **Google Cloud CLI** (`gcloud`) | every command below | [install guide](https://cloud.google.com/sdk/docs/install); open a *fresh* terminal after installing |
+| **Node.js ≥ 20** (for `npx`) | deploys the Cloud Functions glue via `firebase-tools` | `node --version` |
+
+Sign in **twice** — the CLI and the client libraries use separate credential
+stores, and you'll need both:
+
+```bash
+gcloud auth login                       # used by the gcloud commands below
+gcloud auth application-default login   # used by inspect_db.py and firebase-tools
+```
+
+> **Windows note:** the `$env:NAME = 'value'` syntax used by `tasks.ps1` docs is
+> PowerShell-only. In cmd.exe use `set NAME=value` instead.
+
+Pick a Cloud Run/Functions **region co-located with your Firestore database**
+(e.g. a `nam5` database → `us-central1`) — Firestore triggers must run from a
+region compatible with the database's location. Find the location with:
+
+```bash
+gcloud firestore databases list --project <PROJECT_ID>
+```
+
+If that lists **more than one database**, make sure everything points at the
+one the app actually writes: the service, the triggers, and `inspect_db.py`
+all default to the special `(default)` database. A second, *named* database —
+even one literally named `default` — is a completely separate store.
+
+Enable the required APIs (once):
 
 ```bash
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
@@ -215,25 +243,109 @@ gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
   eventarc.googleapis.com firestore.googleapis.com --project <PROJECT_ID>
 ```
 
+### Step 1 — optimizer → Cloud Run
+
+Run from the repo root. Nothing is built locally: the source is uploaded
+(trimmed by `.gcloudignore`) and Cloud Build builds the Dockerfile remotely.
+The first build takes ~10–15 min (CPU torch is large); later deploys are faster.
+
 ```bash
-# 1. Optimizer → Cloud Run
-make deploy PROJECT=<PROJECT_ID>          # or the explicit command:
-# gcloud run deploy vam-optimizer --source . --project <PROJECT_ID> \
-#   --region us-central1 --allow-unauthenticated \
-#   --memory 2Gi --cpu 2 --timeout 300
-# → copy the printed Service URL
+make deploy PROJECT=<PROJECT_ID>     # Linux/macOS/Cloud Shell
+```
+```powershell
+$env:PROJECT = '<PROJECT_ID>'        # Windows PowerShell
+.\tasks.ps1 deploy
+```
 
-# 2. Deploy the Cloud Functions glue wired to that URL (see firebase/README.md)
+Both expand to the same explicit command:
 
-# 3. Let Cloud Run's service account read/write Firestore
+```bash
+gcloud run deploy vam-optimizer --source . --project <PROJECT_ID> \
+  --region us-central1 --allow-unauthenticated \
+  --memory 2Gi --cpu 2 --timeout 300
+```
+
+Copy the printed **Service URL** and check `<service-url>/health` — it should
+report the five parameter names, the database, and the trial budget.
+
+### Step 2 — let the service read/write Firestore
+
+Cloud Run runs as the project's default compute service account; grant it
+Firestore access:
+
+```bash
 PROJECT_NUMBER=$(gcloud projects describe <PROJECT_ID> --format='value(projectNumber)')
 gcloud projects add-iam-policy-binding <PROJECT_ID> \
   --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
   --role="roles/datastore.user"
 ```
 
-**Don't blind-deploy `firestore:rules`** — that would overwrite your app's live
-security rules. Deploy rules separately, only after reviewing them.
+### Step 3 — Cloud Functions glue + Firestore indexes
+
+The two Firestore triggers live in [`firebase/`](firebase/) as reference
+copies. Assemble a standard Firebase folder anywhere (it does **not** need to
+be inside this repo):
+
+```
+firebase-deploy/
+├── firebase.json            ← see below
+├── firestore.indexes.json   ← copy from firebase/  (READ THE WARNING BELOW)
+└── functions/
+    ├── index.js             ← copy from firebase/
+    ├── package.json         ← copy from firebase/
+    └── .env                 ← one line:  CLOUD_RUN_URL=<service-url from step 1>
+```
+
+> **⚠️ Index deploys are declarative.** `firestore:indexes` makes the database
+> match the file: any composite index that exists on the database but is *not*
+> listed in `firestore.indexes.json` is **deleted** — including indexes your
+> app team created by hand for the app's own queries. Before the first deploy,
+> list what's live and merge it into the file:
+>
+> ```bash
+> gcloud firestore indexes composite list --project <PROJECT_ID> --database="(default)"
+> ```
+
+Install the functions' dependencies once — `firebase-tools` loads the code
+locally to discover the triggers, so deploy fails without them:
+
+```bash
+cd firebase-deploy/functions && npm install && cd ..
+```
+
+`firebase.json` — the `firestore` block is **required**; without it the
+`firestore:indexes` target is *silently skipped*:
+
+```json
+{
+  "functions": { "source": "functions" },
+  "firestore": { "indexes": "firestore.indexes.json" }
+}
+```
+
+There is deliberately no `"rules"` key: **never blind-deploy
+`firestore:rules`** — it would overwrite the app's live security rules.
+
+Deploy (no `firebase login` needed — `firebase-tools` falls back to the
+application-default credentials from the prerequisites):
+
+```bash
+npx firebase-tools deploy --only functions,firestore:indexes --project <PROJECT_ID>
+```
+
+If the very first functions deploy fails with an **Eventarc Service Agent
+permission** error, that's a first-use propagation delay, not a real failure —
+wait a few minutes and rerun the same command.
+
+If your database is *named* rather than `(default)`, set `database: "<name>"`
+in each trigger's options in `index.js` first (see `firebase/README.md`).
+
+### Step 4 — verify end-to-end
+
+See [Operate & verify](#operate--verify) below: hit `/health`, create a test
+`users/{uid}` doc and watch `parameterValues/{uid}_step_1` appear, then write a
+fake `interventionResults` doc for that uid and watch `step_2` appear. Use a
+clearly-fake uid and clear the test docs before the real study starts.
 
 ## Operate & verify
 
@@ -287,6 +399,13 @@ step — are flagged in `space.py`.
 and stores the minimum (1 Hz). `space.canonicalize()` bakes that in: every
 proposed/encoded/deduplicated `constant` config has `interval == 1.0`, so the
 optimizer never spends trials varying a field that has no effect.
+
+**Puls feasibility:** the app floors the off-time between pulses at 10 ms
+(`off = max(0.01, 1/interval − duration)`); past that floor the pulses still
+play full-length and `interval` loses its effect. `is_feasible()` therefore
+blocks `duration > 1/interval − 0.01` for `puls`, and MOBO proposals in that
+region are minimally repaired by `project_feasible()` (duration lowered to the
+largest grid level that fits the period).
 
 ## License & citing
 

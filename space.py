@@ -150,6 +150,16 @@ class CategoricalParam:
 # interval and pattern were confirmed by the app team (Mahdi) 2026-07-21;
 # the intensity and sharpness design ranges (0–1) come from the study memo.
 # The remaining optimizer-side choices are flagged # TODO below.
+#
+# PLANNED, NOT YET IN THE APP (confirmed still planned 2026-07-21): the study
+# design adds two more parameters — pulse count (1–4; use list_grid([1,2,3,4]))
+# and interval-within-pulse-set (Hz; range TBD). Do NOT add them here until the
+# app actually writes those fields (every interventionResults doc must carry
+# every field in PARAM_NAMES, or docs are skipped as malformed). When they
+# land: get the exact Firestore field names + ranges from the app team, add
+# them below, and extend canonicalize() — both are meaningless for "constant"
+# (no pulses), and interval-within is meaningless when pulse count == 1. D and
+# the trial budget adapt automatically (D=7 → 2·(D+1)=16 Sobol, 21 total).
 CONT_PARAMS: list[ContinuousParam] = [
     # intensity — Firestore double, design range 0–1 (study memo; Weber JND ≈ 13 %).
     # Grid floor 0.20 = minimum usefully-perceptible cue — an OPTIMIZER-side
@@ -167,8 +177,9 @@ CONT_PARAMS: list[ContinuousParam] = [
     # the larger step (0.240 s) so neighbours are distinguishable BOTH ways
     # -> 84 levels. NOTE: 20 s is what the APP can render, not necessarily what
     # the STUDY should test — lower `hi` here if multi-second stimuli make
-    # trials impractically long. See is_feasible() for the pending
-    # duration-vs-interval overlap constraint.
+    # trials impractically long. For "puls" the duration×interval constraint in
+    # is_feasible() caps pulses at 1/interval − 0.01 s (≤ 0.99 s) anyway; the
+    # long tail of this grid is reachable only by "constant".
     ContinuousParam("duration", linear_grid(0.03, 20.00, 0.240), round_ndigits=3),
 
     # interval — Firestore double, HERTZ (pulses per second; 4 = 4 pulses/s).
@@ -214,24 +225,52 @@ def canonicalize(raw: dict) -> dict:
 
 
 # ── Hard-constraint hook ─────────────────────────────────────────────────────
+# The app floors the off-time between pulses at 10 ms: off = max(0.01,
+# 1/interval − duration). Beyond that floor the pulses still play full-length,
+# the effective rate degrades to 1/(duration + 0.01), and `interval` loses any
+# real effect (app team, 2026-07-21) — so such configs are mislabelled stimuli
+# and must never be proposed.
+PULS_MIN_OFF = 0.01  # seconds
+_FEAS_EPS = 1e-9     # float slack so exact-boundary grid levels stay feasible
+
+
 def is_feasible(raw: dict) -> bool:
     """Return False for configurations that must never be tested.
 
     JNDs are already handled by the grid — use this ONLY for genuine
-    constraints. Examples (uncomment / adapt to your fields):
-
-        # PENDING (asked the app team 2026-07-21): for "puls", can a single
-        # pulse (`duration`) be longer than the pulse-set period 1/interval?
-        # The live test config (0.5 s @ 4 Hz) suggests the app allows it, but
-        # if it actually clamps or merges into a continuous vibration, enable:
-        # if raw["pattern"] == "puls" and raw["duration"] > 1.0 / raw["interval"]:
-        #     return False
+    constraints. Further examples (uncomment / adapt to your fields):
 
         # Forbid a specific pattern at very low intensity:
         # if raw["pattern"] == "constant" and raw["intensity"] < 0.4:
         #     return False
     """
+    # For "puls", a full pulse plus the 10 ms minimum gap must fit its period.
+    if raw["pattern"] == "puls" and \
+            raw["duration"] > 1.0 / raw["interval"] - PULS_MIN_OFF + _FEAS_EPS:
+        return False
     return True
+
+
+def project_feasible(raw: dict) -> dict:
+    """Minimally repair an infeasible candidate onto the feasible set.
+
+    Used on MOBO proposals (optimizer_core.choose_next): qLogNEHVI actively
+    chases high-uncertainty regions, which includes the never-observed
+    infeasible corner — rejecting outright would swap the model's choice for a
+    random one, so instead we keep the proposal and lower `duration` to the
+    largest grid level that fits the period. (Sobol draws keep plain rejection:
+    resampling preserves uniform coverage of the feasible region.)
+    """
+    if is_feasible(raw):
+        return raw
+    out = dict(raw)
+    if out["pattern"] == "puls":
+        budget = 1.0 / out["interval"] - PULS_MIN_OFF
+        p = next(p for p in CONT_PARAMS if p.name == "duration")
+        fits = [lv for lv in p.levels if lv <= budget + _FEAS_EPS]
+        if fits:  # always true for our grids: 0.03 s fits even at 20 Hz
+            out["duration"] = round(float(fits[-1]), p.round_ndigits)
+    return out
 
 
 # ── Encoding: Firestore record  <->  GP model row ────────────────────────────

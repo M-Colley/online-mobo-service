@@ -93,6 +93,28 @@ def test_canonicalize_constant_pins_interval():
             assert raw == space.canonicalize(raw), f"non-canonical proposal {raw}"
 
 
+def test_puls_duration_interval_constraint():
+    # App floors the off-time at 10 ms: a pulse plus that gap must fit 1/interval.
+    base = {p.name: round(float(p.levels[0]), p.round_ndigits) for p in space.CONT_PARAMS}
+    # the app team's own example: 0.5 s pulses @ ~4 Hz render at ~2 Hz -> blocked
+    assert not space.is_feasible(dict(base, pattern="puls", duration=0.51, interval=4.3))
+    assert space.is_feasible(dict(base, pattern="puls", duration=0.03, interval=4.3))
+    # exact boundary stays feasible: 1 Hz -> budget 0.99, grid level 0.99
+    assert space.is_feasible(dict(base, pattern="puls", duration=0.99, interval=1.0))
+    assert not space.is_feasible(dict(base, pattern="puls", duration=1.23, interval=1.0))
+    # "constant" is exempt (no pulses)
+    assert space.is_feasible(dict(base, pattern="constant", duration=19.95, interval=1.0))
+    # projection repairs duration only, keeping the rest of the proposal
+    bad = dict(base, pattern="puls", duration=12.75, interval=4.3)
+    proj = space.project_feasible(bad)
+    assert space.is_feasible(proj)
+    assert proj["duration"] == 0.03 and proj["interval"] == 4.3
+    assert proj["intensity"] == bad["intensity"] and proj["pattern"] == "puls"
+    # feasible configs pass through projection untouched
+    good = dict(base, pattern="puls", duration=0.27, interval=2.074)
+    assert space.project_feasible(good) == good
+
+
 def test_obs_key_dedup():
     raw = space.random_feasible(seed=1)
     assert space.obs_key(raw) == space.obs_key(dict(raw))       # stable
