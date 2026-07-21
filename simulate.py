@@ -25,7 +25,7 @@ import optimizer_core as core
 torch.manual_seed(0)
 np.random.seed(0)
 
-N_SOBOL = 2 * (space.D + 1)
+N_SOBOL = 2 * (space.D + 1)  # deliberately one more than the memo's 2n+1 (conservative)
 N_TOTAL = N_SOBOL + 5
 
 

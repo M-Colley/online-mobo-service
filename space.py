@@ -147,23 +147,28 @@ class CategoricalParam:
 # ═══════════════════════════════════════════════════════════════════════════
 # Field names below MATCH the live Firestore schema (confirmed 2026-07-14 from
 # interventionResults / parameterValues docs). Units + ranges for duration,
-# interval and pattern were confirmed by the app team (Mahdi) 2026-07-21.
-# Intensity/sharpness ranges are still placeholders — see the # TODO flags.
+# interval and pattern were confirmed by the app team (Mahdi) 2026-07-21;
+# the intensity and sharpness design ranges (0–1) come from the study memo.
+# The remaining optimizer-side choices are flagged # TODO below.
 CONT_PARAMS: list[ContinuousParam] = [
-    # intensity — Firestore double in [0, 1] (e.g. 0.8). Weber JND ≈ 13 % (geometric).
-    # Floor 0.20 = minimum perceptible cue; adjust per hardware.  # TODO confirm floor + app max
+    # intensity — Firestore double, design range 0–1 (study memo; Weber JND ≈ 13 %).
+    # Grid floor 0.20 = minimum usefully-perceptible cue — an OPTIMIZER-side
+    # choice (a Weber grid needs lo > 0), not an app limit. Revisit after pilot.
     ContinuousParam("intensity", weber_grid(0.20, 1.00, 0.13), round_ndigits=3),
 
-    # sharpness — Firestore double in [0, 1] (e.g. 0.3). No psychophysical JND yet.
-    # Placeholder: uniform 0.20 grid (6 levels). Replace step after pilot.  # TODO confirm app range
+    # sharpness — Firestore double, design range 0–1 (study memo). No
+    # psychophysical JND literature (memo: "needs pilot testing"); placeholder
+    # uniform 0.20 grid (6 levels).  # TODO set the step after the pilot
     ContinuousParam("sharpness", linear_grid(0.00, 1.00, 0.20), round_ndigits=3),
 
-    # duration — Firestore double, SECONDS. App range 0.03–20 s (confirmed by the
-    # app team 2026-07-21). JND is ASYMMETRIC (+0.240 s to notice an increase,
-    # −0.110 s a decrease); we use the larger step (0.240 s) so neighbours are
-    # distinguishable BOTH ways -> 84 levels. NOTE: 20 s is what the APP can
-    # render, not necessarily what the STUDY should test — lower `hi` here if
-    # multi-second stimuli make trials impractically long.
+    # duration — Firestore double, SECONDS; length of EACH PULSE (study memo).
+    # App range 0.03–20 s (confirmed by the app team 2026-07-21). JND is
+    # ASYMMETRIC (+0.240 s to notice an increase, −0.110 s a decrease); we use
+    # the larger step (0.240 s) so neighbours are distinguishable BOTH ways
+    # -> 84 levels. NOTE: 20 s is what the APP can render, not necessarily what
+    # the STUDY should test — lower `hi` here if multi-second stimuli make
+    # trials impractically long. See is_feasible() for the pending
+    # duration-vs-interval overlap constraint.
     ContinuousParam("duration", linear_grid(0.03, 20.00, 0.240), round_ndigits=3),
 
     # interval — Firestore double, HERTZ (pulses per second; 4 = 4 pulses/s).
@@ -215,8 +220,11 @@ def is_feasible(raw: dict) -> bool:
     JNDs are already handled by the grid — use this ONLY for genuine
     constraints. Examples (uncomment / adapt to your fields):
 
-        # Keep the gap between pulses longer than a pulse itself:
-        # if raw["interval"] <= raw["duration"]:
+        # PENDING (asked the app team 2026-07-21): for "puls", can a single
+        # pulse (`duration`) be longer than the pulse-set period 1/interval?
+        # The live test config (0.5 s @ 4 Hz) suggests the app allows it, but
+        # if it actually clamps or merges into a continuous vibration, enable:
+        # if raw["pattern"] == "puls" and raw["duration"] > 1.0 / raw["interval"]:
         #     return False
 
         # Forbid a specific pattern at very low intensity:

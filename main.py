@@ -39,9 +39,10 @@ FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE", "(default)")
 db = firestore.Client(database=FIRESTORE_DATABASE)
 
 # ── Trial-budget constants ───────────────────────────────────────────────────
-# Rule from the study memo: "first 2n+1 trials are the same (Sobol), then the
-# personalised optimisation happens in the subsequent trials." n = D here, so
-# N_SOBOL adapts automatically if you add/remove parameters in space.py.
+# Sobol budget: 2·(D+1) — deliberately ONE MORE than the study memo's "first
+# 2n+1 trials" (n = D) as a conservative buffer before the GP takes over
+# (decision 2026-07-21). Adapts automatically if you add/remove parameters in
+# space.py.
 N_SOBOL = int(os.environ.get("N_SOBOL", str(2 * (space.D + 1))))
 N_MOBO = int(os.environ.get("N_MOBO", "5"))
 N_TOTAL = int(os.environ.get("N_TOTAL", str(N_SOBOL + N_MOBO)))

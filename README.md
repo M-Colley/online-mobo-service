@@ -43,8 +43,10 @@ python simulate.py     # full study loop: Sobol → MOBO, hypervolume rising
 Each participant runs a fixed number of trials. For every trial the service
 picks the next stimulus configuration to test:
 
-- **First `2·D + 1` trials** — a scrambled **Sobol** sequence (space-filling
-  exploration), where `D` is the number of parameters.
+- **First `2·(D+1)` trials** — a scrambled **Sobol** sequence (space-filling
+  exploration), where `D` is the number of parameters. (Deliberately one more
+  than the study memo's `2n+1` rule, as a conservative buffer before the GP
+  takes over.)
 - **Remaining trials** — **GP-based MOBO** (`qLogNEHVI`), which fits a Gaussian
   process to the two objective scores and proposes the configuration expected to
   most improve the Pareto front.
@@ -142,7 +144,7 @@ Everything study-specific lives in **`space.py`**. To repurpose the service:
 2. **Objectives** — `OBJECTIVE_FIELDS` (default `["subjectiveScore",
    "objectiveScore"]`, both maximized, in `[0,1]`). Add a third for 3 objectives;
    everything downstream adapts automatically.
-3. **Trial budget** — auto-derived: `N_SOBOL = 2·D + 1`, `N_TOTAL = N_SOBOL + 5`.
+3. **Trial budget** — auto-derived: `N_SOBOL = 2·(D+1)`, `N_TOTAL = N_SOBOL + 5`.
    Override with the `N_SOBOL` / `N_MOBO` / `N_TOTAL` env vars.
 4. **Hard constraints** — implement `is_feasible(raw)` (returns `False` for
    configs that must never be tested). Applied to Sobol draws and MOBO candidates.
@@ -161,7 +163,7 @@ All optional; sensible defaults built in. Set on the Cloud Run service with
 | Env var | Default | Meaning |
 |---------|---------|---------|
 | `FIRESTORE_DATABASE` | `(default)` | Firestore database id to use |
-| `N_SOBOL` | `2·D + 1` | random exploration trials before MOBO |
+| `N_SOBOL` | `2·(D+1)` | random exploration trials before MOBO |
 | `N_MOBO` | `5` | MOBO trials after exploration |
 | `N_TOTAL` | `N_SOBOL + N_MOBO` | total trials before `studyCompleted` |
 | `NUM_RESTARTS` | `5` | acqf optimizer restarts |
@@ -269,16 +271,17 @@ checks (`attentionCheckPassed == false`) are excluded from the training data.
 
 ### Parameter fields (VAM study)
 
-Ranges marked ✅ were confirmed by the app team on 2026-07-21; ❓ are still
-placeholders (see the `# TODO` flags in `space.py`).
+Ranges marked ✅ are confirmed (app team 2026-07-21, or the study memo). The
+remaining optimizer-side choices — the intensity grid floor and the sharpness
+step — are flagged in `space.py`.
 
-| Field | Type | Unit / values | App range | Grid |
-|-------|------|---------------|-----------|------|
-| `intensity` | double | amplitude, 0–1 | ❓ (floor/max unconfirmed; grid 0.20–1.00) | Weber, 13 % (14 levels) |
-| `sharpness` | double | 0–1 | ❓ (grid 0.00–1.00) | linear, step 0.20 (6 levels) |
-| `duration`  | double | seconds | ✅ 0.03 – 20 s | linear, step 0.240 (84 levels) |
-| `interval`  | double | **Hz** (pulses per second) | ✅ 1 – 20 Hz | Weber, 20 % (17 levels) |
-| `pattern`   | string | ✅ `"constant"` \| `"puls"` | — | categorical |
+| Field | Type | Unit / values | Range | Grid |
+|-------|------|---------------|-------|------|
+| `intensity` | double | amplitude | ✅ 0–1 (memo; grid floor 0.20 is an optimizer choice) | Weber, 13 % (14 levels) |
+| `sharpness` | double | — | ✅ 0–1 (memo; JND step pending pilot) | linear, step 0.20 (6 levels) |
+| `duration`  | double | seconds (length of each pulse) | ✅ 0.03 – 20 s (app) | linear, step 0.240 (84 levels) |
+| `interval`  | double | **Hz** (pulse-set rate) | ✅ 1 – 20 Hz (app) | Weber, 20 % (17 levels) |
+| `pattern`   | string | `"constant"` \| `"puls"` | ✅ | categorical |
 
 **Canonical form:** the app *ignores* `interval` when `pattern == "constant"`
 and stores the minimum (1 Hz). `space.canonicalize()` bakes that in: every
