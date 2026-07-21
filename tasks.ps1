@@ -9,17 +9,17 @@ $Region  = $env:REGION  ; if (-not $Region)  { $Region  = "us-central1" }
 $Project = $env:PROJECT   # required for deploy: $env:PROJECT = "my-gcp-project"
 $Service = $env:SERVICE ; if (-not $Service) { $Service = "vam-optimizer" }
 
-$modules = @("vam_space.py", "optimizer_core.py", "main.py",
-             "simulate.py", "test_service.py", "test_vam_space.py", "inspect_db.py")
+$modules = @("space.py", "optimizer_core.py", "main.py",
+             "simulate.py", "tests/test_service.py", "tests/test_space.py", "inspect_db.py")
 
 switch ($Task) {
-    "describe" { python vam_space.py }
-    "unit"     { python test_vam_space.py }
+    "describe" { python space.py }
+    "unit"     { python tests/test_space.py }
     "test" {
         python -m py_compile @modules
-        python test_vam_space.py
+        python tests/test_space.py
         python simulate.py
-        python test_service.py
+        python tests/test_service.py
     }
     "inspect" { python inspect_db.py }
     "deploy" {

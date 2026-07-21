@@ -29,10 +29,10 @@ jobs:
         run: python -m py_compile space.py optimizer_core.py main.py simulate.py tests/test_service.py tests/test_space.py inspect_db.py
 
       - name: Unit tests (search space)
-        run: python tests/test_vam_space.py
+        run: python tests/test_space.py
 
       - name: Optimizer simulation
-        run: python tests/simulate.py
+        run: python simulate.py
 
       - name: Full HTTP service test
         run: python tests/test_service.py

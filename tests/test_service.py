@@ -1,7 +1,7 @@
 """
 Offline smoke test of the FULL Flask service (main.py) — no cloud, no emulator.
 
-    python test_service.py
+    python tests/test_service.py
 
 Drives the real HTTP endpoints through Flask's test client against an in-memory
 fake of the exact Firestore API surface main.py uses (FieldFilter where /
@@ -21,6 +21,9 @@ excluded from training data, and the study completes at exactly N_TOTAL.
 from __future__ import annotations
 
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Must be set BEFORE importing main so firestore.Client() constructs offline.
 os.environ.setdefault("FIRESTORE_EMULATOR_HOST", "localhost:1")  # never contacted
@@ -30,7 +33,7 @@ import numpy as np
 import torch
 
 import main
-import vam_space as space
+import space
 
 torch.manual_seed(0)
 np.random.seed(0)

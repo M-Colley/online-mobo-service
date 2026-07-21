@@ -4,7 +4,7 @@ REGION  ?= us-central1
 PROJECT ?=
 SERVICE ?= vam-optimizer
 PY      ?= python3
-MODULES  = vam_space.py optimizer_core.py main.py simulate.py test_service.py test_vam_space.py inspect_db.py
+MODULES  = space.py optimizer_core.py main.py simulate.py tests/test_service.py tests/test_space.py inspect_db.py
 
 .PHONY: help describe unit test inspect deploy
 
@@ -13,16 +13,16 @@ help:
 	@echo "deploy needs PROJECT=<gcp-project-id> (REGION defaults to $(REGION))"
 
 describe:            ## print the resolved JND grids
-	$(PY) vam_space.py
+	$(PY) space.py
 
 unit:               ## fast search-space unit tests (sub-second)
-	$(PY) test_vam_space.py
+	$(PY) tests/test_space.py
 
 test:               ## compile + unit + simulate + full service test
 	$(PY) -m py_compile $(MODULES)
-	$(PY) test_vam_space.py
+	$(PY) tests/test_space.py
 	$(PY) simulate.py
-	$(PY) test_service.py
+	$(PY) tests/test_service.py
 
 inspect:            ## read-only Firestore inspector (needs auth + GOOGLE_CLOUD_PROJECT)
 	$(PY) inspect_db.py

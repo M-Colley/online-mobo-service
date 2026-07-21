@@ -5,7 +5,7 @@ Run this to sanity-check the optimizer before deploying:
 
     python simulate.py
 
-It drives the exact code path Cloud Run uses (vam_space + optimizer_core) for a
+It drives the exact code path Cloud Run uses (space + optimizer_core) for a
 full N_TOTAL-trial run against a synthetic "participant" whose ratings peak at a
 hidden favourite configuration, and asserts:
 
@@ -19,7 +19,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-import vam_space as space
+import space
 import optimizer_core as core
 
 torch.manual_seed(0)

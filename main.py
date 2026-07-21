@@ -7,7 +7,7 @@ Same Firestore-mediated architecture as the original optimizer_service:
 
 Only the search space and the parameter field handling changed — the whole
 communication layer (Cloud Functions, locks, idempotency, hypervolume logging)
-is untouched. The search space lives entirely in vam_space.py; the GP/acqf
+is untouched. The search space lives entirely in space.py; the GP/acqf
 logic lives in optimizer_core.py. Both are Firestore-free and unit-testable.
 """
 
@@ -24,7 +24,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from botorch.utils.multi_objective.hypervolume import Hypervolume
 from botorch.utils.multi_objective.pareto import is_non_dominated
 
-import vam_space as space
+import space
 import optimizer_core as core
 
 logging.basicConfig(level=logging.INFO)
@@ -41,7 +41,7 @@ db = firestore.Client(database=FIRESTORE_DATABASE)
 # ── Trial-budget constants ───────────────────────────────────────────────────
 # Rule from the study memo: "first 2n+1 trials are the same (Sobol), then the
 # personalised optimisation happens in the subsequent trials." n = D here, so
-# N_SOBOL adapts automatically if you add/remove parameters in vam_space.
+# N_SOBOL adapts automatically if you add/remove parameters in space.py.
 N_SOBOL = int(os.environ.get("N_SOBOL", str(2 * (space.D + 1))))
 N_MOBO = int(os.environ.get("N_MOBO", "5"))
 N_TOTAL = int(os.environ.get("N_TOTAL", str(N_SOBOL + N_MOBO)))
@@ -79,7 +79,7 @@ def log_hypervolume(user_id: str, Y: torch.Tensor, phase_step: int, obs_count: i
 def load_observations(user_id: str):
     """Return (X_model [n,D], Y [n,m], last_phase_step, observed_keys) or Nones.
 
-    Reads the VAM parameter fields (names come from vam_space.PARAM_NAMES) and
+    Reads the VAM parameter fields (names come from space.PARAM_NAMES) and
     the objective fields (space.OBJECTIVE_FIELDS) straight from Firestore.
     """
     docs = list(

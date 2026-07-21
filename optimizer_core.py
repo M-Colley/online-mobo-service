@@ -8,7 +8,7 @@ returns the next candidate as a *snapped, on-grid* raw parameter dict.
   • Categorical dims present  ->  MixedSingleTaskGP + optimize_acqf_mixed
   • No categorical dims        ->  SingleTaskGP    + optimize_acqf   (proven path)
 
-The continuous optimum is snapped to the JND grid in vam_space.snap_candidate(),
+The continuous optimum is snapped to the JND grid in space.snap_candidate(),
 so no candidate is ever finer than a JND. qLogNEHVI is used for both — it is far
 more sample-efficient than TPE in the ~15-trial regime this study runs in.
 """
@@ -28,7 +28,7 @@ from botorch.optim import optimize_acqf, optimize_acqf_mixed
 from botorch.sampling.normal import SobolQMCNormalSampler
 from gpytorch.mlls import SumMarginalLogLikelihood
 
-import vam_space as space
+import space
 
 # ── Acqf-optimiser knobs ─────────────────────────────────────────────────────
 # Deliberately lighter than the original single-GP service: optimize_acqf_mixed

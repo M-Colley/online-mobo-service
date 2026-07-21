@@ -177,14 +177,14 @@ values keep a single `/updatePolicy` call well under the Cloud Run 300 s timeout
 No cloud needed. Run these after any edit to `space.py`:
 
 ```bash
-python space.py       # print the resolved grids — eyeball the level counts
-python test_space.py  # fast unit tests (sub-second): grids, snapping, encoding
-python simulate.py        # offline optimizer loop: on-grid, unique, hypervolume rises
-python test_service.py    # full HTTP service against an in-memory Firestore fake
+python space.py                # print the resolved grids — eyeball the level counts
+python tests/test_space.py     # fast unit tests (sub-second): grids, snapping, encoding
+python simulate.py             # offline optimizer loop: on-grid, unique, hypervolume rises
+python tests/test_service.py   # full HTTP service against an in-memory Firestore fake
 ```
 
-`test_space.py` is the quick guard while editing the search space;
-`simulate.py` / `test_service.py` exercise the GP and the full request loop.
+`tests/test_space.py` is the quick guard while editing the search space;
+`simulate.py` / `tests/test_service.py` exercise the GP and the full request loop.
 
 Or use the task runner (`make` on Linux/Cloud Shell, `tasks.ps1` on Windows):
 
@@ -266,6 +266,24 @@ checks (`attentionCheckPassed == false`) are excluded from the training data.
   names) → the app's snapshot listener applies it.
 - Study ends at `N_TOTAL` observations → the service sets
   `users/{pid}.studyCompleted = true`.
+
+### Parameter fields (VAM study)
+
+Ranges marked ✅ were confirmed by the app team on 2026-07-21; ❓ are still
+placeholders (see the `# TODO` flags in `space.py`).
+
+| Field | Type | Unit / values | App range | Grid |
+|-------|------|---------------|-----------|------|
+| `intensity` | double | amplitude, 0–1 | ❓ (floor/max unconfirmed; grid 0.20–1.00) | Weber, 13 % (14 levels) |
+| `sharpness` | double | 0–1 | ❓ (grid 0.00–1.00) | linear, step 0.20 (6 levels) |
+| `duration`  | double | seconds | ✅ 0.03 – 20 s | linear, step 0.240 (84 levels) |
+| `interval`  | double | **Hz** (pulses per second) | ✅ 1 – 20 Hz | Weber, 20 % (17 levels) |
+| `pattern`   | string | ✅ `"constant"` \| `"puls"` | — | categorical |
+
+**Canonical form:** the app *ignores* `interval` when `pattern == "constant"`
+and stores the minimum (1 Hz). `space.canonicalize()` bakes that in: every
+proposed/encoded/deduplicated `constant` config has `interval == 1.0`, so the
+optimizer never spends trials varying a field that has no effect.
 
 ## License & citing
 

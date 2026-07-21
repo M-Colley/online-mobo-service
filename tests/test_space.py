@@ -1,19 +1,25 @@
 """
-Fast unit tests for the search-space logic in vam_space.py — NO GP fitting, so
-this runs in well under a second. Run it every time you edit vam_space.py:
+Fast unit tests for the search-space logic in space.py — NO GP fitting, so
+this runs in well under a second. Run it every time you edit space.py:
 
-    python test_vam_space.py
+    python tests/test_space.py
 
 Covers the grid builders, snapping/encoding round-trips, dedup keys, the acqf
-plumbing (bounds + categorical combinations), Sobol/​random draws, and the
-fail-fast validator. Plain asserts — no pytest needed.
+plumbing (bounds + categorical combinations), Sobol/​random draws, the
+canonical-form hook, and the fail-fast validator. Plain asserts — no pytest
+needed.
 """
 
 from __future__ import annotations
 
+import os
+import sys
+
 import numpy as np
 
-import space as space
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import space
 
 
 def test_grid_builders():
@@ -65,6 +71,26 @@ def test_encode_decode_roundtrip():
     assert len(row) == space.D
     back = space.snap_candidate(row)
     assert back == raw, (back, raw)
+
+
+def test_canonicalize_constant_pins_interval():
+    # constant = sustained vibration → the app ignores `interval` and stores the
+    # minimum (1 Hz), so all constant configs collapse onto interval == 1.0.
+    base = {p.name: round(float(p.levels[0]), p.round_ndigits) for p in space.CONT_PARAMS}
+    a = dict(base, pattern="constant", interval=4.0)
+    b = dict(base, pattern="constant", interval=1.0)
+    assert space.canonicalize(a)["interval"] == 1.0
+    assert space.obs_key(a) == space.obs_key(b), "same stimulus must share one dedup key"
+    # encoding + snapping goes through the canonical form too
+    assert space.snap_candidate(space.to_model_row(a))["interval"] == 1.0
+    # "puls" keeps its interval untouched
+    c = dict(base, pattern="puls", interval=4.0)
+    assert space.canonicalize(c)["interval"] == 4.0
+    assert space.obs_key(c) != space.obs_key(a)
+    # every proposal path emits canonical configs
+    for i in range(8):
+        for raw in (space.sobol_next(i), space.random_feasible(seed=i)):
+            assert raw == space.canonicalize(raw), f"non-canonical proposal {raw}"
 
 
 def test_obs_key_dedup():
@@ -123,7 +149,7 @@ def main():
     for t in tests:
         t()
         print(f"  ok  {t.__name__}")
-    print(f"\nPASS: {len(tests)} vam_space unit tests")
+    print(f"\nPASS: {len(tests)} search-space unit tests")
 
 
 if __name__ == "__main__":

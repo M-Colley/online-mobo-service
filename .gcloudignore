@@ -3,8 +3,7 @@ README.md
 LICENSE
 CITATION.cff
 simulate.py
-test_service.py
-test_vam_space.py
+tests/
 inspect_db.py
 Makefile
 tasks.ps1

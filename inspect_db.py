@@ -1,7 +1,8 @@
 """
-Read-only Firestore inspector — run it with your new DB access to extract the
-facts still missing from vam_space.py (interval range/units, full pattern list)
-and to sanity-check the optimizer's data contract.
+Read-only Firestore inspector — run it with your DB access to verify the ranges
+baked into space.py against live data (and to extract the facts still missing:
+the intensity/sharpness ranges) and to sanity-check the optimizer's data
+contract.
 
 It only READS. It never writes, updates, or deletes anything.
 
@@ -22,7 +23,7 @@ from collections import Counter
 
 from google.cloud import firestore
 
-import vam_space as space
+import space
 
 # GCP project to read from. Cloud Shell sets GOOGLE_CLOUD_PROJECT automatically;
 # elsewhere: GOOGLE_CLOUD_PROJECT=<your-project-id> python inspect_db.py
@@ -74,24 +75,25 @@ def main():
     params = scan(db, PARAMS)
     survey = scan(db, SURVEY)
 
-    # ── The two blockers ────────────────────────────────────────────────────
+    # ── Range / category checks against space.py ────────────────────────────
     print("\n" + "=" * 70)
-    print("BLOCKER 1 — pattern: the complete set of category strings")
+    print("CHECK 1 — pattern: category strings seen in live data")
     patterns = Counter()
     for d in results + params:
         if "pattern" in d:
             patterns[d["pattern"]] += 1
     for p, c in patterns.most_common():
         print(f"    {p!r:<18} {c}")
-    print(f"  -> put this list in vam_space.py CAT_PARAMS. Currently: "
-          f"{space.CAT_PARAMS[0].categories if space.CAT_PARAMS else '[]'}")
+    print(f"  -> must be a subset of space.py CAT_PARAMS. Currently: "
+          f"{space.CAT_PARAMS[0].categories if space.CAT_PARAMS else '[]'} "
+          f"(app team confirmed constant/puls, 2026-07-21)")
 
-    print("\nBLOCKER 2 — interval + other ranges (to set the JND grids)")
+    print("\nCHECK 2 — observed ranges vs the JND grids in space.py")
     for field in ("intensity", "sharpness", "duration", "interval"):
         vals = [d[field] for d in results + params if field in d]
         _numeric_summary(field, vals)
-    print("  -> interval min/max tells you the range; the spacing of observed "
-          "values hints at the unit (Hz vs seconds).")
+    print("  -> duration 0.03–20 s and interval 1–20 Hz are app-team-confirmed; "
+          "use the intensity/sharpness min/max here to close the remaining TODOs.")
 
     # ── Contract / surveyResponses question ─────────────────────────────────
     print("\n" + "=" * 70)

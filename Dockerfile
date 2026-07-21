@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY vam_space.py optimizer_core.py main.py ./
+COPY space.py optimizer_core.py main.py ./
 
 ENV PORT=8080
 

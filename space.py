@@ -35,6 +35,14 @@ Because the space is discrete, dropping infeasible combinations is trivial:
 edit `is_feasible()` below. That is the disciplined equivalent of the Optuna
 `raise TrialPruned()` trick, but applied to *hard constraints* only — JNDs are
 handled by the grid spacing, not by pruning.
+
+Parameters the app ignores in some modes
+----------------------------------------
+When a parameter has no effect for certain configurations (here: `interval`
+when pattern == "constant" — a sustained vibration has no pulse rate), the
+configuration is mapped to a canonical form in `canonicalize()` below. That
+stops the optimizer from "exploring" a dead dimension and makes dedup treat
+physically-identical stimuli as one configuration.
 """
 
 from __future__ import annotations
@@ -138,27 +146,31 @@ class CategoricalParam:
 #  needs confirmation (exact Firestore name, unit, and range) before the run.
 # ═══════════════════════════════════════════════════════════════════════════
 # Field names below MATCH the live Firestore schema (confirmed 2026-07-14 from
-# interventionResults / parameterValues docs). Ranges marked # TODO still need
-# confirming from the app/hardware team.
+# interventionResults / parameterValues docs). Units + ranges for duration,
+# interval and pattern were confirmed by the app team (Mahdi) 2026-07-21.
+# Intensity/sharpness ranges are still placeholders — see the # TODO flags.
 CONT_PARAMS: list[ContinuousParam] = [
     # intensity — Firestore double in [0, 1] (e.g. 0.8). Weber JND ≈ 13 % (geometric).
-    # Floor 0.20 = minimum perceptible cue; adjust per hardware.  # TODO confirm floor
+    # Floor 0.20 = minimum perceptible cue; adjust per hardware.  # TODO confirm floor + app max
     ContinuousParam("intensity", weber_grid(0.20, 1.00, 0.13), round_ndigits=3),
 
     # sharpness — Firestore double in [0, 1] (e.g. 0.3). No psychophysical JND yet.
-    # Placeholder: uniform 0.20 grid (6 levels). Replace step after pilot.  # TODO
+    # Placeholder: uniform 0.20 grid (6 levels). Replace step after pilot.  # TODO confirm app range
     ContinuousParam("sharpness", linear_grid(0.00, 1.00, 0.20), round_ndigits=3),
 
-    # duration — Firestore double, SECONDS (e.g. 0.5). Perception floor > 0.03 s.
-    # JND is ASYMMETRIC (+0.240 s to notice an increase, −0.110 s a decrease); we
-    # use the larger step (0.240 s) so neighbours are distinguishable BOTH ways.
-    # Switch to 0.110 for finer resolution if the pilot supports it. Confirm ceiling.  # TODO
-    ContinuousParam("duration", linear_grid(0.06, 1.00, 0.240), round_ndigits=3),
+    # duration — Firestore double, SECONDS. App range 0.03–20 s (confirmed by the
+    # app team 2026-07-21). JND is ASYMMETRIC (+0.240 s to notice an increase,
+    # −0.110 s a decrease); we use the larger step (0.240 s) so neighbours are
+    # distinguishable BOTH ways -> 84 levels. NOTE: 20 s is what the APP can
+    # render, not necessarily what the STUDY should test — lower `hi` here if
+    # multi-second stimuli make trials impractically long.
+    ContinuousParam("duration", linear_grid(0.03, 20.00, 0.240), round_ndigits=3),
 
-    # interval — Firestore double (e.g. 4). Weber JND ≈ 20 % (geometric).
-    # !! UNITS (Hz vs seconds) AND RANGE UNCONFIRMED — placeholder [1, 8] merely
-    # brackets the observed value 4. Fix the range once the app team confirms.  # TODO
-    ContinuousParam("interval", weber_grid(1.00, 8.00, 0.20), round_ndigits=3),
+    # interval — Firestore double, HERTZ (pulses per second; 4 = 4 pulses/s).
+    # App range 1–20 Hz (confirmed by the app team 2026-07-21). Weber JND ≈ 20 %
+    # (geometric) -> 17 levels. The app IGNORES this field when pattern ==
+    # "constant" and stores the minimum (1 Hz) — handled in canonicalize().
+    ContinuousParam("interval", weber_grid(1.00, 20.00, 0.20), round_ndigits=3),
 ]
 
 # Nominal parameter(s). Set CAT_PARAMS = [] to disable the categorical machinery
@@ -176,6 +188,24 @@ D_CAT = len(CAT_PARAMS)
 D = D_CONT + D_CAT                       # model input dimensionality
 CAT_DIMS = list(range(D_CONT, D))        # categorical column indices for MixedSingleTaskGP
 PARAM_NAMES = [p.name for p in CONT_PARAMS] + [p.name for p in CAT_PARAMS]
+
+
+# ── Canonical-form hook ──────────────────────────────────────────────────────
+def canonicalize(raw: dict) -> dict:
+    """Map a configuration to its canonical, physically-equivalent form.
+
+    The app IGNORES `interval` when pattern == "constant" (a sustained vibration
+    has no pulse rate) and writes the minimum, 1 Hz, into the field — confirmed
+    by the app team 2026-07-21. Two "constant" configs differing only in
+    interval are therefore the SAME stimulus. Pinning interval to 1.0 here
+    (a) keeps the optimizer from spending trials "exploring" a dimension that
+    has no effect, and (b) makes obs_key() treat identical stimuli as one
+    configuration. Applied everywhere a config is encoded, proposed, or keyed.
+    """
+    out = dict(raw)
+    if out.get("pattern") == "constant":
+        out["interval"] = 1.0
+    return out
 
 
 # ── Hard-constraint hook ─────────────────────────────────────────────────────
@@ -203,6 +233,7 @@ def to_model_row(rec: dict) -> list[float]:
     Continuous dims are normalised to [0, 1]; categorical dims are integer
     category indices (MixedSingleTaskGP consumes them raw, not normalised).
     """
+    rec = canonicalize(rec)
     row = [p.normalize(float(rec[p.name])) for p in CONT_PARAMS]
     row += [float(p.index(rec[p.name])) for p in CAT_PARAMS]
     return row
@@ -215,7 +246,7 @@ def snap_candidate(model_row) -> dict:
         raw[p.name] = p.snap(p.denormalize(float(model_row[j])))
     for k, p in enumerate(CAT_PARAMS):
         raw[p.name] = p.value(model_row[D_CONT + k])
-    return raw
+    return canonicalize(raw)
 
 
 def model_bounds() -> np.ndarray:
@@ -242,7 +273,12 @@ def fixed_features_list() -> list[dict]:
 
 
 def obs_key(raw: dict) -> tuple:
-    """Hashable identity of a configuration, for de-duplication."""
+    """Hashable identity of a configuration, for de-duplication.
+
+    Canonicalized first, so e.g. constant@4Hz and constant@1Hz (the same
+    physical stimulus) share one key.
+    """
+    raw = canonicalize(raw)
     key = []
     for p in CONT_PARAMS:
         key.append(round(float(raw[p.name]), p.round_ndigits))
@@ -267,6 +303,7 @@ def sobol_next(obs_count: int) -> dict:
         rng = random.Random(1000 + obs_count + attempt)
         for p in CAT_PARAMS:
             raw[p.name] = rng.choice(p.categories)
+        raw = canonicalize(raw)
         if is_feasible(raw):
             return raw
     return raw  # give up on feasibility after 64 tries (shouldn't happen)
@@ -280,6 +317,7 @@ def random_feasible(seed: int) -> dict:
                for p in CONT_PARAMS}
         for p in CAT_PARAMS:
             raw[p.name] = rng.choice(p.categories)
+        raw = canonicalize(raw)
         if is_feasible(raw):
             return raw
     return raw
