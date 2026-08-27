@@ -73,19 +73,24 @@ def test_encode_decode_roundtrip():
     assert back == raw, (back, raw)
 
 
-def test_canonicalize_constant_pins_interval():
-    # constant = sustained vibration → the app ignores `interval` and stores the
-    # minimum (1 Hz), so all constant configs collapse onto interval == 1.0.
+def test_canonicalize_constant_pins_dead_dims():
+    # constant = sustained vibration → the app ignores `interval` (stores 1 Hz)
+    # and duration is conceptually infinite (pinned to the grid max), so all
+    # constant configs collapse onto intensity × sharpness.
     base = {p.name: round(float(p.levels[0]), p.round_ndigits) for p in space.CONT_PARAMS}
-    a = dict(base, pattern="constant", interval=4.0)
-    b = dict(base, pattern="constant", interval=1.0)
-    assert space.canonicalize(a)["interval"] == 1.0
+    a = dict(base, pattern="constant", interval=4.0, duration=0.51)
+    b = dict(base, pattern="constant", interval=1.0, duration=12.75)
+    ca = space.canonicalize(a)
+    assert ca["interval"] == 1.0
+    assert ca["duration"] == space.CONSTANT_DURATION == 19.95
     assert space.obs_key(a) == space.obs_key(b), "same stimulus must share one dedup key"
     # encoding + snapping goes through the canonical form too
-    assert space.snap_candidate(space.to_model_row(a))["interval"] == 1.0
-    # "puls" keeps its interval untouched
+    snapped = space.snap_candidate(space.to_model_row(a))
+    assert snapped["interval"] == 1.0 and snapped["duration"] == space.CONSTANT_DURATION
+    # "puls" keeps interval and duration untouched
     c = dict(base, pattern="puls", interval=4.0)
     assert space.canonicalize(c)["interval"] == 4.0
+    assert space.canonicalize(c)["duration"] == base["duration"]
     assert space.obs_key(c) != space.obs_key(a)
     # every proposal path emits canonical configs
     for i in range(8):
@@ -102,8 +107,8 @@ def test_puls_duration_interval_constraint():
     # exact boundary stays feasible: 1 Hz -> budget 0.99, grid level 0.99
     assert space.is_feasible(dict(base, pattern="puls", duration=0.99, interval=1.0))
     assert not space.is_feasible(dict(base, pattern="puls", duration=1.23, interval=1.0))
-    # "constant" is exempt (no pulses)
-    assert space.is_feasible(dict(base, pattern="constant", duration=19.95, interval=1.0))
+    # "constant" is exempt (no pulses) — its canonical form must be feasible
+    assert space.is_feasible(space.canonicalize(dict(base, pattern="constant")))
     # projection repairs duration only, keeping the rest of the proposal
     bad = dict(base, pattern="puls", duration=12.75, interval=4.3)
     proj = space.project_feasible(bad)

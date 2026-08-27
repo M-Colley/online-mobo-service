@@ -175,11 +175,10 @@ CONT_PARAMS: list[ContinuousParam] = [
     # App range 0.03–20 s (confirmed by the app team 2026-07-21). JND is
     # ASYMMETRIC (+0.240 s to notice an increase, −0.110 s a decrease); we use
     # the larger step (0.240 s) so neighbours are distinguishable BOTH ways
-    # -> 84 levels. NOTE: 20 s is what the APP can render, not necessarily what
-    # the STUDY should test — lower `hi` here if multi-second stimuli make
-    # trials impractically long. For "puls" the duration×interval constraint in
-    # is_feasible() caps pulses at 1/interval − 0.01 s (≤ 0.99 s) anyway; the
-    # long tail of this grid is reachable only by "constant".
+    # -> 84 levels. In practice only part of this grid is live: "puls" pulses
+    # are capped at 1/interval − 0.01 s (≤ 0.99 s) by is_feasible(), and
+    # "constant" is pinned to the grid max (~19.95 s ≈ "infinite") by
+    # canonicalize() — see CONSTANT_DURATION below.
     ContinuousParam("duration", linear_grid(0.03, 20.00, 0.240), round_ndigits=3),
 
     # interval — Firestore double, HERTZ (pulses per second; 4 = 4 pulses/s).
@@ -207,20 +206,36 @@ PARAM_NAMES = [p.name for p in CONT_PARAMS] + [p.name for p in CAT_PARAMS]
 
 
 # ── Canonical-form hook ──────────────────────────────────────────────────────
+_DURATION = next(p for p in CONT_PARAMS if p.name == "duration")
+
+# "Effectively infinite" sentinel for constant's duration: the TOP of the
+# duration grid (~19.95 s). A sustained vibration conceptually never stops, so
+# duration is a dead dimension for "constant". The grid max is deliberately the
+# robust choice for BOTH possible app behaviours: if the app ignores duration
+# for constant the value is irrelevant; if it plays duration-then-stop, ~20 s
+# outlasts any realistic interaction. Once the app team formally ignores
+# duration for constant (and standardises a written sentinel), this — and
+# possibly the grid ceiling itself — can be revisited.
+CONSTANT_DURATION = round(float(_DURATION.levels[-1]), _DURATION.round_ndigits)
+
+
 def canonicalize(raw: dict) -> dict:
     """Map a configuration to its canonical, physically-equivalent form.
 
-    The app IGNORES `interval` when pattern == "constant" (a sustained vibration
-    has no pulse rate) and writes the minimum, 1 Hz, into the field — confirmed
-    by the app team 2026-07-21. Two "constant" configs differing only in
-    interval are therefore the SAME stimulus. Pinning interval to 1.0 here
-    (a) keeps the optimizer from spending trials "exploring" a dimension that
-    has no effect, and (b) makes obs_key() treat identical stimuli as one
-    configuration. Applied everywhere a config is encoded, proposed, or keyed.
+    For pattern == "constant" (a sustained vibration) the pulse-shaping fields
+    do not apply: the app IGNORES `interval` (writes the minimum, 1 Hz —
+    confirmed by the app team 2026-07-21), and `duration` is conceptually
+    infinite, so we pin it to CONSTANT_DURATION ("as long as possible").
+    Constant configs differing only in these fields are the SAME stimulus.
+    Pinning them (a) keeps the optimizer from spending trials "exploring"
+    dimensions that have no effect — constant reduces to intensity × sharpness
+    — and (b) makes obs_key() treat identical stimuli as one configuration.
+    Applied everywhere a config is encoded, proposed, or keyed.
     """
     out = dict(raw)
     if out.get("pattern") == "constant":
         out["interval"] = 1.0
+        out["duration"] = CONSTANT_DURATION
     return out
 
 
@@ -266,10 +281,9 @@ def project_feasible(raw: dict) -> dict:
     out = dict(raw)
     if out["pattern"] == "puls":
         budget = 1.0 / out["interval"] - PULS_MIN_OFF
-        p = next(p for p in CONT_PARAMS if p.name == "duration")
-        fits = [lv for lv in p.levels if lv <= budget + _FEAS_EPS]
+        fits = [lv for lv in _DURATION.levels if lv <= budget + _FEAS_EPS]
         if fits:  # always true for our grids: 0.03 s fits even at 20 Hz
-            out["duration"] = round(float(fits[-1]), p.round_ndigits)
+            out["duration"] = round(float(fits[-1]), _DURATION.round_ndigits)
     return out
 
 

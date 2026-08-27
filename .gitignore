@@ -10,3 +10,7 @@ venv/
 # local artifacts
 *.zip
 firebase-debug.log
+
+# Study data and generated analysis output (participant data: never commit)
+analysis/trials.csv
+analysis/output/
