@@ -4,24 +4,60 @@
       "collectionGroup": "interventionResults",
       "queryScope": "COLLECTION",
       "fields": [
-        { "fieldPath": "pid", "order": "ASCENDING" },
-        { "fieldPath": "phaseStep", "order": "ASCENDING" }
+        {
+          "fieldPath": "pid",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "phaseStep",
+          "order": "ASCENDING"
+        }
       ]
     },
     {
       "collectionGroup": "parameterValues",
       "queryScope": "COLLECTION",
       "fields": [
-        { "fieldPath": "pid", "order": "ASCENDING" },
-        { "fieldPath": "phaseStep", "order": "DESCENDING" }
+        {
+          "fieldPath": "pid",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "phaseStep",
+          "order": "DESCENDING"
+        }
       ]
     },
     {
       "collectionGroup": "parameterValues",
       "queryScope": "COLLECTION",
       "fields": [
-        { "fieldPath": "pid", "order": "ASCENDING" },
-        { "fieldPath": "createdAt", "order": "DESCENDING" }
+        {
+          "fieldPath": "pid",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "parameterValues",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "pid",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "schemaVersion",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
       ]
     }
   ],

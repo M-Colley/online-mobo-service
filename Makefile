@@ -15,7 +15,7 @@ help:
 describe:            ## print the resolved JND grids
 	$(PY) space.py
 
-unit:               ## fast search-space unit tests (sub-second)
+unit:               ## search-space unit tests (~5 s, exhaustive rules pass)
 	$(PY) tests/test_space.py
 
 test:               ## compile + unit + simulate + full service test

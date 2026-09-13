@@ -17,7 +17,7 @@ See the optimizer converge on a simulated participant in two commands:
 ```bash
 pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
-python simulate.py     # full study loop: Sobol → MOBO, hypervolume rising
+python simulate.py     # full 18-round loop: anchor → Sobol → MOBO, HV rising
 ```
 
 ---
@@ -41,19 +41,29 @@ python simulate.py     # full study loop: Sobol → MOBO, hypervolume rising
 
 ## What it does
 
-Each participant runs a fixed number of trials. For every trial the service
-picks the next stimulus configuration to test:
+Each participant runs a fixed number of **rounds** (18 for the current study —
+the app's security rules cap `roundNumber` there). For every round the service
+picks the next configuration to test:
 
-- **First `2·(D+1)` trials** — a scrambled **Sobol** sequence (space-filling
-  exploration), where `D` is the number of parameters. (Deliberately one more
-  than the study memo's `2n+1` rule, as a conservative buffer before the GP
-  takes over.)
-- **Remaining trials** — **GP-based MOBO** (`qLogNEHVI`), which fits a Gaussian
+- **Round 1** — the **anchor**: a fixed expert baseline design, identical for
+  every participant. It is the origin of the search space and the natural
+  within-participant control.
+- **Rounds 2…`2·(D+1)`+1** — a scrambled **Sobol** sequence (space-filling
+  exploration), where `D` is the number of optimized dimensions. (Deliberately
+  one more than the study memo's `2n+1` rule, as a conservative buffer.)
+- **Remaining rounds** — **GP-based MOBO** (`qLogNEHVI`), which fits a Gaussian
   process to the two objective scores and proposes the configuration expected to
   most improve the Pareto front.
 
-Every proposed configuration is **snapped onto a JND-spaced grid**, so no two
-tested settings are closer than one just-noticeable difference.
+Every proposal lies on a **JND-spaced grid**, so no two tested settings are
+closer than one just-noticeable difference.
+
+> **What a "configuration" is here.** For the VAM/multinav study a candidate is a
+> whole haptic *design*: 14 navigation cues × 5 burst values = 70 numbers. With
+> at most 18 session-level score pairs those 70 numbers are unidentifiable, so
+> the optimizer searches **4 integer JND knobs** that scale the expert baseline
+> and expand deterministically to all 70. See
+> [Data contract with the app](#data-contract-with-the-app).
 
 ## Architecture
 
@@ -82,7 +92,9 @@ mediated by Firestore, so the app stays simple and the optimizer stays stateless
 4. The app's snapshot listener picks up the new config and renders it.
 
 Registration: creating a `users/{uid}` doc fires `registerUserOnCreate` →
-`POST /registerUser` → the service writes `step_1` (the Sobol seed).
+`POST /registerUser` → the service writes `step_1` (the anchor design). Note the
+live security rules deny client writes to `users/`, so in this study that doc is
+created by an admin, not by the app.
 
 ## Repository layout
 
@@ -93,13 +105,13 @@ Registration: creating a `users/{uid}` doc fires `registerUserOnCreate` →
 | `main.py` | Flask service: Firestore I/O, idempotency, hypervolume logging, HTTP endpoints. |
 | `simulate.py` | Offline optimizer loop against a synthetic participant (asserts on-grid, unique, HV rises). |
 | `tests/test_service.py` | Full HTTP service against an in-memory Firestore fake (register → N trials → done, dedup, attention-check exclusion). |
-| `tests/test_space.py` | Fast unit tests for the search-space logic (no GP fitting; sub-second). |
-| `inspect_db.py` | Read-only Firestore inspector — extracts real parameter ranges/categories to finalize `space.py`. |
+| `tests/test_space.py` | Unit tests for the search-space logic (no GP fitting; ~5 s, including an exhaustive pass of every reachable design against the app's rules). |
+| `inspect_db.py` | Read-only Firestore inspector — document shape, observed ranges, every burst against the rules mirror, and the app's own listener query. **Run it first** whenever the app team says the parameters changed. |
 | `firebase/` | Reference copies of the Cloud Functions glue + Firestore indexes (see its README). |
 | `Makefile` / `tasks.ps1` | Task runners for the common validate/deploy commands (Linux / Windows). |
 | `requirements.txt` / `Dockerfile` | Pinned deps (incl. `torch==2.13.0`); CPU-only torch; JIT-compiles the fast EHVI kernel. |
 | `.github/workflows/ci.yml` | CI: compile + the three test scripts on every push/PR. |
-| `analysis/` | R evaluation of the study data: `export_firestore.py` (Firestore → tidy CSV) and `evaluate_mobo.R` (hypervolume, Pareto fronts, IGD+, APA reporting via `colleyRstats` + `moocore`). |
+| `analysis/` | R evaluation of the study data: `export_firestore.py` (Firestore → two tidy CSVs — one row per round, one row per round×cue) and `evaluate_mobo.R` (hypervolume, Pareto fronts, IGD+, APA reporting via `colleyRstats` + `moocore`). |
 | `AGENTS.md` | Short orientation for AI coding agents: ground rules, the deploy model, and the traps. |
 | `LICENSE` | MIT license. |
 
@@ -111,10 +123,17 @@ a JND are indistinguishable, so testing both wastes a trial. We encode this by
 
 | Grid type | For | Spacing |
 |-----------|-----|---------|
-| `weber_grid` (geometric) | Weber's-law params (intensity 13 %, interval 20 %) | ×(1 + jnd) |
-| `linear_grid` (additive) | absolute-JND params (duration, seconds) | fixed step |
-| `list_grid` (explicit) | naturally discrete params (e.g. pulse count) | given levels |
-| categorical | nominal params (pattern) | `MixedSingleTaskGP` |
+| `weber_grid` (geometric) | Weber's-law params (amplitude, rate) | ×(1 + jnd) |
+| `linear_grid` (additive) | absolute-JND params (seconds) | fixed step |
+| `list_grid` (explicit) | naturally discrete params, **and integer JND knobs** | given levels |
+| categorical | nominal params | `MixedSingleTaskGP` |
+
+The current study uses the third row for everything: each optimized dimension is
+an integer count of JNDs away from a baseline design. That has a second benefit
+worth knowing — `ContinuousParam.normalize()` is **linear**, so a geometric grid
+of raw values is *not* equally spaced in model coordinates and a stationary GP
+kernel cannot treat "one JND" as a constant distance. On an integer JND axis it
+can, by construction.
 
 We do **not** enumerate the full grid (~10⁵–10⁶ combos). The GP optimizes in
 continuous space (sample-efficient) and the winner is **snapped** to the grid
@@ -131,8 +150,10 @@ Hard constraints, when you have them, go in `is_feasible()`.
 
 Everything study-specific lives in **`space.py`**. To repurpose the service:
 
-1. **Parameters** — edit `CONT_PARAMS` / `CAT_PARAMS`. Each `name` must match the
-   Firestore field the app reads/writes. Choose a grid builder per parameter:
+1. **Parameters** — edit `CONT_PARAMS` / `CAT_PARAMS`. For a FLAT contract each
+   `name` is the Firestore field the app reads/writes; for a nested one (this
+   study) the names are the optimizer's own dimensions and `space.expand()`
+   maps them onto the document. Choose a grid builder per parameter:
    ```python
    CONT_PARAMS = [
        ContinuousParam("intensity", weber_grid(0.2, 1.0, 0.13)),   # Weber JND
@@ -141,14 +162,19 @@ Everything study-specific lives in **`space.py`**. To repurpose the service:
    ]
    CAT_PARAMS = [ CategoricalParam("pattern", ["a", "b", "c"]) ]   # or [] for none
    ```
+   If the app's document is **nested** (as in the current study), the names above
+   are the optimizer's dimensions rather than Firestore field names, and
+   `space.expand()` maps a point in that space onto the document the app reads.
+   `main.build_proposal_doc()` assembles the rest of the doc.
    `_validate()` runs on import and rejects duplicate names, empty/​non-ascending
    grids, and empty category lists — so a bad edit fails immediately with a clear
    message, not deep inside the GP at request time.
 2. **Objectives** — `OBJECTIVE_FIELDS` (default `["subjectiveScore",
    "objectiveScore"]`, both maximized, in `[0,1]`). Add a third for 3 objectives;
    everything downstream adapts automatically.
-3. **Trial budget** — auto-derived: `N_SOBOL = 2·(D+1)`, `N_TOTAL = N_SOBOL + 5`.
-   Override with the `N_SOBOL` / `N_MOBO` / `N_TOTAL` env vars.
+3. **Trial budget** — auto-derived: `N_SOBOL = 1 + 2·(D+1)` (one anchor round plus
+   the Sobol draws), `N_TOTAL = space.MAX_ROUND_NUMBER`. Override with the
+   `N_SOBOL` / `N_TOTAL` env vars; `N_MOBO` is derived and read-only.
 4. **Hard constraints** — implement `is_feasible(raw)` (returns `False` for
    configs that must never be tested). Applied to Sobol draws and MOBO candidates.
 
@@ -161,30 +187,37 @@ read the space generically from `space.py`.
 ### Changing parameters after deploy
 
 Editing `space.py` and redeploying is safe **between participants**. Doing it
-while participants are mid-study is not: `to_model_row()` reads *every* name in
-`PARAM_NAMES` out of each stored doc, so a change to the space retroactively
-reinterprets — or invalidates — history that is already in Firestore.
+while participants are mid-study is not: a knob vector is meaningful only
+relative to the space that produced it, so a change retroactively reinterprets
+— or invalidates — history that is already in Firestore. Every proposal is
+stamped with `mobo.spaceVersion` and the service refuses to train on a round
+from a different one.
 
 | Edit | Effect on a participant who is already mid-study |
 |------|--------------------------------------------------|
-| **Add, rename, or remove a parameter** | Every earlier doc now lacks (or gains) a field → `to_model_row()` raises `KeyError` → `load_observations()` skips it as malformed and the history collapses to 0 observations. `D` also changes, so `N_SOBOL = 2·(D+1)` and `N_TOTAL` change mid-study. |
-| **Change a grid's `lo` / `hi`** | Docs still parse, but `normalize()` rescales them: values outside the new range map outside `[0, 1]` and the GP trains on out-of-bounds inputs without complaining. |
-| **Change a step, `round_ndigits`, or a category list** | `obs_key()` identity changes → configurations that were already tested are no longer recognised as observed, and can be proposed a second time. |
+| **Add, rename, or remove a knob** | `D` changes, so `N_SOBOL = 1 + 2·(D+1)` moves mid-study. Bump `SPACE_VERSION` when you do: earlier rounds are then ignored for training (logged, not silent) rather than being reinterpreted under the new meaning. |
+| **Change a knob's range** | Earlier knob values may fall outside the new grid. `on_grid()` rejects them and the round is dropped from training — loudly, in the logs — instead of being normalised to an out-of-bounds model input. |
+| **Change a step size or `SEED_DESIGN`** | The same knob integer now renders a *different stimulus*, so history is silently wrong unless `SPACE_VERSION` is bumped. This is the one that looks harmless and is not. |
+| **Change the wire format** (`expand()`, the cue list, the doc shape) | The app may no longer be able to render or echo the design. Coordinate with the app team first — this is their contract, not ours. |
 
-> **⚠️ The stall.** The first row has a sharp failure mode worth knowing by
-> sight. When the history collapses, `obs_count` drops, so the service computes
-> `next_phase_step = obs_count + 1` — a step whose `parameterValues` doc
-> **already exists**. The idempotency guard then returns
-> `{"ok": true, "skipped": true}` on every later trial and the participant never
-> receives another stimulus. In the Cloud Run logs it reads as `skipping
-> malformed doc` followed by `already exists — skipping duplicate`.
+> **⚠️ What this costs now.** The old permanent stall — where a collapsed
+> history made the service re-propose a step whose doc already existed and
+> answer `{"skipped": true}` forever — is gone: `next_phase_step` is derived
+> from **rounds issued** (`max(phaseStep)`), which a broken history cannot move.
+> The remaining cost is quieter and still matters: every unreadable round is
+> excluded from training, so the participant keeps receiving stimuli but the GP
+> never gets enough data to take over and the run silently degrades to pure
+> exploration. Watch for `has N rounds but only M usable observations` in the
+> Cloud Run logs — that line is the warning.
 
 **Safe procedure**
 
 1. Edit `space.py`, then run the full local suite (`make test` / `.\tasks.ps1
    test`). `_validate()` and `tests/test_space.py` catch bad grids at import.
-2. Tell the app team **before** deploying if a Firestore field name changed —
-   the app must write the new field or every incoming doc is malformed.
+2. Tell the app team **before** deploying if the WIRE FORMAT changed (a cue, a
+   burst field, the doc shape) — that is their contract. Renaming a knob does
+   not touch the wire; bumping `SPACE_VERSION` does not either, but it does
+   exclude earlier rounds from training.
 3. Deploy when no participant is mid-study. If that is impossible, restart the
    affected participants explicitly: delete their `parameterValues/{pid}_step_*`
    and `interventionResults` docs, then re-create `users/{pid}`.
@@ -204,16 +237,16 @@ All optional; sensible defaults built in. Set on the Cloud Run service with
 | Env var | Default | Meaning |
 |---------|---------|---------|
 | `FIRESTORE_DATABASE` | `(default)` | Firestore database id to use |
-| `N_SOBOL` | `2·(D+1)` | random exploration trials before MOBO |
-| `N_MOBO` | `5` | MOBO trials after exploration |
-| `N_TOTAL` | `N_SOBOL + N_MOBO` | total trials before `studyCompleted` |
+| `N_SOBOL` | `space.N_SOBOL_DEFAULT` = `1 + 2·(D+1)` | non-model rounds: 1 anchor + `2·(D+1)` Sobol draws. The GP takes over on *usable observations*, so `N_MOBO = N_TOTAL − N_SOBOL` is a maximum. |
+| `N_TOTAL` | `space.MAX_ROUND_NUMBER` (18) | total **rounds** before `studyCompleted`. Refuses to start above the app's rules cap. |
 | `NUM_RESTARTS` | `5` | acqf optimizer restarts |
 | `RAW_SAMPLES` | `256` | acqf raw samples |
 | `MC_SAMPLES` | `64` | MC samples for the hypervolume estimate |
 
-The acqf knobs are deliberately light: `optimize_acqf_mixed` runs once per
-categorical combination, so cost scales with the number of categories. These
-values keep a single `/updatePolicy` call well under the Cloud Run 300 s timeout.
+The acqf knobs are deliberately light. With `CAT_PARAMS = []` the plain
+`optimize_acqf` path runs (one inner optimisation, not one per categorical
+combination), so a single `/updatePolicy` call stays well under the Cloud Run
+300 s timeout at `D = 4` with ≤18 observations. Re-measure if `D` grows.
 
 ## Local development & validation
 
@@ -221,7 +254,9 @@ No cloud needed. Run these after any edit to `space.py`:
 
 ```bash
 python space.py                # print the resolved grids — eyeball the level counts
-python tests/test_space.py     # fast unit tests (sub-second): grids, snapping, encoding
+python tests/test_space.py     # unit tests (~4 s): grids, snapping, encoding, and an
+                               # EXHAUSTIVE pass over every reachable design vs the
+                               # app's security rules
 python simulate.py             # offline optimizer loop: on-grid, unique, hypervolume rises
 python tests/test_service.py   # full HTTP service against an in-memory Firestore fake
 ```
@@ -503,10 +538,14 @@ firebase functions:log --only updatePolicyOnResult
 ```
 Then create a test `users/{id}` doc and watch `parameterValues/{id}_step_1` appear.
 
-Concurrency & idempotency are handled: a per-user lock serializes same-user
-requests, `parameterValues` docs are written with `create()` (first-wins), and
-duplicate Cloud Function deliveries are detected and skipped. Failed attention
-checks (`attentionCheckPassed == false`) are excluded from the training data.
+Concurrency & idempotency: `parameterValues` docs are written with `create()`,
+which is **first-wins and the only real guard** — the per-user `threading.Lock`
+lives in one Python process while Cloud Run autoscales, so it serializes
+same-user requests only *within* an instance, and the read-then-create check is
+a cross-instance TOCTOU window. Duplicate Cloud Function deliveries are detected
+and skipped. Failed attention checks (`attentionCheckPassed == false`) are
+excluded from the training data but **still consume their round**, because the
+app's rules pin `phaseStep == roundNumber`.
 
 ## Troubleshooting
 
@@ -514,54 +553,91 @@ checks (`attentionCheckPassed == false`) are excluded from the training data.
 |---------|--------------------|
 | Cloud Function never fires | Trigger is on the wrong database. It must match the app's DB (default `(default)`); a **named** DB needs `database:` set on the trigger. |
 | `/updatePolicy` 500s | Check Cloud Run logs. A single malformed doc is skipped with a warning, not fatal. |
-| Optimizer proposes a value the app can't render | A `CONT_PARAMS` range or `CAT_PARAMS` category doesn't match the app — reconcile via `inspect_db.py`. |
-| Deploy/queries need a Firestore index | `firebase deploy --only firestore:indexes` (the `pid`+`phaseStep` composite indexes are in `firestore.indexes.json`). |
+| `/updatePolicy` answers **422** and the function logs `REFUSED (422, not retried)` | `space.expand()` rendered a design the rules mirror rejects — only possible after an edit to `space.py` that passed import. Fix the space; do not redeploy the trigger. `python tests/test_space.py` reproduces it. |
+| Deploy/queries need a Firestore index | `firebase deploy --only firestore:indexes`. The file must also carry the **app's** indexes — including `parameterValues(pid, schemaVersion, createdAt DESC)`, which its listener needs — or the declarative deploy deletes them. |
+| Participant receives nothing, and there is **no error anywhere on our side** | The app's write was rejected by its own security rules. Almost always an illegal burst (a float `pulseCount`, a value out of range, a rate above 120 Hz) or a `phase` other than `'exploration'`. Reproduce with `python inspect_db.py` — CHECK 3 runs the rules mirror over every burst in the database. |
 | `firebase deploy` fails with `User code failed to load. Cannot determine backend specification. Timeout after 10000` | Not a code error — `firebase-tools` loads `functions/` in a subprocess to discover the triggers and gives it 10 s, which Windows/cold-cache machines routinely miss. Confirm the code is fine with `node -e "require('./index.js')"` in `functions/`, then re-run with `FUNCTIONS_DISCOVERY_TIMEOUT=120` set. Also check `functions/package.json`'s `engines.node` matches your local `node --version`. |
-| Participant stops receiving stimuli; logs show `skipping malformed doc` then `already exists — skipping duplicate` | `space.py` changed while they were mid-study — their history no longer parses. See [Changing parameters after deploy](#changing-parameters-after-deploy). |
+| Logs show `has N rounds but only M usable observations` | Results are arriving but are not trainable — a `spaceVersion` mismatch after a mid-study redeploy, or the app echoing designs off the knob grid. The participant still gets stimuli, but the model phase is shrinking. See [Changing parameters after deploy](#changing-parameters-after-deploy). |
+| Logs show `echoed a design outside the knob grid` | The app clamped or substituted a value before rendering. The round is dropped from training (and from the analysis) because the participant felt something the optimizer cannot name. Ask the app team whether the echo is what was *delivered* or what was *received*. |
 | Every Firestore call returns `403 This API method requires billing to be enabled` | Billing is disabled on that project. The data is retained but unreadable until billing is restored. |
 | `--allow-unauthenticated` rejected on deploy | Org policy `iam.allowedPolicyMemberDomains` blocks `allUsers` — see [Org-policy gotchas](#org-policy-gotchas). |
 | Slow MOBO step / timeout | Lower `RAW_SAMPLES`/`NUM_RESTARTS`/`MC_SAMPLES`; ensure the image built the fast EHVI kernel (needs `build-essential`+`ninja`, already in the Dockerfile). |
 
 ## Data contract with the app
 
-- App writes `interventionResults/{id}` with `pid`, `phaseStep`,
-  `attentionCheckPassed`, the objective fields, **and every field in
-  `space.PARAM_NAMES`** (the exact values it rendered).
-- Service writes `parameterValues/{pid}_step_N` with the next config (same field
-  names) → the app's snapshot listener applies it.
-- Study ends at `N_TOTAL` observations → the service sets
-  `users/{pid}.studyCompleted = true`.
+The authoritative contract is the app team's Firestore **security rules** (ruleset
+`42691aae`, released 2026-09-08). They validate the app's own writes, so a design
+this service writes that violates them is accepted from us (the Admin SDK bypasses
+rules) and then makes the *app's* result write illegal — which produces no error
+on our side at all. `space.rules_valid_burst()` mirrors the predicate and
+`write_next_params()` refuses to write a design that fails it.
 
-### Parameter fields (VAM study)
+- Service writes `parameterValues/{pid}_step_N`: `schemaVersion: 2`, `candidateId`,
+  `phase: "exploration"`, `phaseStep`/`roundNumber`, `hapticMode: "burst"`,
+  `isFinalRound`, `createdAt`, the 14-cue `haptics` map, and a `mobo` map holding
+  the knob vector, the real optimizer phase and the `spaceVersion`.
+- App writes `interventionResults/{id}` echoing the design it rendered, plus
+  `pid`, `phaseStep` == `roundNumber`, both objective fields,
+  `attentionCheckPassed`, `touchedTarget`, `parameterDocumentId`, `candidateId`,
+  `sessionId`, `mapName`, `authUid`, `resultId`.
+- Service writes the anytime hypervolume to `moboMetrics/{pid}_step_N` — **never**
+  into the app's own doc, whose rules permit a client update only for a retry that
+  changes nothing but `createdAt`.
+- Study ends at `N_TOTAL` **rounds** → `users/{pid}.studyCompleted = true`. The app
+  cannot read `users/`, so the end-of-study signal it *can* see is `isFinalRound`
+  on the last proposal.
 
-Ranges marked ✅ are confirmed (app team 2026-07-21, or the study memo). The
-remaining optimizer-side choices — the intensity grid floor and the sharpness
-step — are flagged in `space.py`.
+### The burst profile (per cue)
 
-| Field | Type | Unit / values | Range | Grid |
-|-------|------|---------------|-------|------|
-| `intensity` | double | amplitude | ✅ 0–1 (memo; grid floor 0.20 is an optimizer choice) | Weber, 13 % (14 levels) |
-| `sharpness` | double | — | ✅ 0–1 (memo; JND step pending pilot) | linear, step 0.20 (6 levels) |
-| `duration`  | double | seconds (length of each pulse) | ✅ 0.03 – 20 s (app) | linear, step 0.240 (84 levels) |
-| `interval`  | double | **Hz** (pulse-set rate) | ✅ 1 – 20 Hz (app) | Weber, 20 % (17 levels) |
-| `pattern`   | string | `"constant"` \| `"puls"` | ✅ | categorical |
+Each of the 14 cues carries exactly these five keys — no more, no fewer (the rule
+uses `hasOnly`, so a sixth key is fatal):
 
-**Canonical form:** for `pattern == "constant"` (a sustained vibration) the
-pulse-shaping fields don't apply: the app *ignores* `interval` (stores the
-minimum, 1 Hz), and `duration` is conceptually infinite — the cue plays for as
-long as the interaction lasts. `space.canonicalize()` bakes both in: every
-proposed/encoded/deduplicated `constant` config has `interval == 1.0` and
-`duration == 19.95` (the grid max, "as long as possible" — correct whether the
-app ignores duration or plays it to the end). `constant` therefore reduces to
-intensity × sharpness, and the optimizer never spends trials varying fields
-that have no effect.
+| Field | Type | Meaning | Range (enforced by the rules) |
+|-------|------|---------|-------------------------------|
+| `intensity` | double | Core Haptics amplitude | 0 – 1 |
+| `sharpness` | double | Core Haptics timbre | 0 – 1 |
+| `pulseCount` | **int64** | pulses inside the burst | 1 – 120, **and** ≤ `onDuration × 120` |
+| `onDuration` | double | length of the **whole burst**, seconds | 0.01 – 2.0 |
+| `offDuration` | double | silence before the burst repeats, seconds | 0.01 – 2.0 |
 
-**Puls feasibility:** the app floors the off-time between pulses at 10 ms
-(`off = max(0.01, 1/interval − duration)`); past that floor the pulses still
-play full-length and `interval` loses its effect. `is_feasible()` therefore
-blocks `duration > 1/interval − 0.01` for `puls`, and MOBO proposals in that
-region are minimally repaired by `project_feasible()` (duration lowered to the
-largest grid level that fits the period).
+So the pulse **rate** is `pulseCount / onDuration` Hz and the cross-constraint is a
+120 Hz cap (confirmed by the app team, 2026-09-11 — every cue in their seed design
+sits at exactly 40, 60 or 120 Hz). `pulseCount` must be a genuine integer: a
+Python `float` lands in Firestore as a double and fails `pulseCount is int`.
+
+### The 14 cues
+
+`start`, `onRoute`, `offRoute`, `onRouteIntersection`, `offRouteIntersection`,
+`landmark`, `end`, `street`, `onRouteSidewalk`, `offRouteSidewalk`,
+`onRouteCrosswalk`, `offRouteCrosswalk`, `turn`, `intersectionCenter`.
+
+### What is optimized
+
+14 × 5 = 70 numbers against at most 18 session-level score pairs is
+under-determined — a GP over 70 inputs fits 70 lengthscales from 18 points, so the
+posterior is the prior and `qLogNEHVI` degenerates into quasi-random search. The
+optimizer therefore searches four **integer JND knobs**, offsets from the app
+team's seed design (`space.SEED_DESIGN`, copied verbatim from the live doc):
+
+| Knob | Levels | One step | Applies to |
+|------|--------|----------|------------|
+| `gainIntensity` | 9 (−6…+2) | ×1.13 | every cue's `intensity` |
+| `gainSharpness` | 7 (−3…+3) | +0.20 | every cue's `sharpness` (placeholder step) |
+| `gainRate` | 11 (−8…+2) | ×1.20 | every cue's pulse rate |
+| `gainBurstLength` | 8 (−4…+3) | ×1.25 | every cue's `onDuration` (placeholder step) |
+
+`space.expand()` scales each cue **multiplicatively** from its seed value, so the
+contrasts the app team designed between cues survive at every knob setting —
+re-gridding absolute per-cue values does not (at low settings the 14 cues collapse
+onto one intensity and the navigation signal is destroyed). Knobs all zero
+reproduces the seed design exactly, so the expert baseline is reachable and is the
+worst case, not a lucky draw. `offDuration` is held at its seed value pending an
+answer on whether a cue loops.
+
+The whole grid is 9 × 7 × 11 × 8 = **5,544 designs**; `tests/test_space.py` checks
+exhaustively that every one of them satisfies the live rules and that the map is
+injective (so a rendered design can be inverted back to its knobs, which is how
+history is read back from what the app echoed).
 
 ## License & citing
 

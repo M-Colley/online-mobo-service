@@ -22,7 +22,10 @@ const CLOUD_RUN_URL = process.env.CLOUD_RUN_URL;
  * so step_1 is written from the Sobol seed before the app even connects.
  */
 exports.registerUserOnCreate = onDocumentCreated(
-  "users/{userId}",
+  // The optimizer image is large (CPU torch), so a cold start can take well over
+  // the 60 s default. retry:true is safe because the service writes proposals
+  // with create() (first-wins), so a redelivery cannot double-write.
+  { document: "users/{userId}", timeoutSeconds: 300, retry: true },
   async (event) => {
     const userId = event.params.userId;
 
@@ -39,6 +42,17 @@ exports.registerUserOnCreate = onDocumentCreated(
 
     const txt = await res.text();
     console.log(`[${userId}] registerUser response:`, res.status, txt);
+    // 4xx = the optimizer REFUSED deterministically (e.g. a design its rules
+    // mirror rejects): retrying would only repeat the refusal, so log loudly
+    // and stop. 5xx = transient; throw so the retry actually happens — without
+    // it the participant silently never receives a round-1 design.
+    if (res.status >= 400 && res.status < 500) {
+      console.error(`[${userId}] registerUser REFUSED (${res.status}, not retried): ${txt}`);
+      return;
+    }
+    if (res.status >= 500) {
+      throw new Error(`registerUser failed with ${res.status}: ${txt}`);
+    }
   }
 );
 
@@ -46,7 +60,7 @@ exports.registerUserOnCreate = onDocumentCreated(
  * When the app writes a completed trial, ask the optimizer for the next config.
  */
 exports.updatePolicyOnResult = onDocumentCreated(
-  { document: "interventionResults/{resultId}", timeoutSeconds: 300 },
+  { document: "interventionResults/{resultId}", timeoutSeconds: 240, retry: true },
   async (event) => {
     const data = event.data.data();
     const userId = data.pid;
@@ -78,5 +92,17 @@ exports.updatePolicyOnResult = onDocumentCreated(
 
     const txt = await res.text();
     console.log("Optimizer response:", res.status, txt);
+    // 4xx = a deterministic refusal (the optimizer answers 422 for a design its
+    // rules mirror rejects). Retrying would re-run the whole GP fit for the
+    // same answer, for up to 24 h — so log it as an error and stop here.
+    if (res.status >= 400 && res.status < 500) {
+      console.error(`[${userId}] updatePolicy REFUSED (${res.status}, not retried): ${txt}`);
+      return;
+    }
+    // 5xx = transient: the optimizer never wrote the next design. Throwing is
+    // the only way the participant gets another chance at it.
+    if (res.status >= 500) {
+      throw new Error(`updatePolicy failed with ${res.status}: ${txt}`);
+    }
   }
 );

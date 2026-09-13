@@ -1,13 +1,18 @@
 """
-Fast unit tests for the search-space logic in space.py — NO GP fitting, so
-this runs in well under a second. Run it every time you edit space.py:
+Fast unit tests for the search-space logic in space.py. Run it every time you
+edit space.py:
 
     python tests/test_space.py
 
 Covers the grid builders, snapping/encoding round-trips, dedup keys, the acqf
-plumbing (bounds + categorical combinations), Sobol/​random draws, the
-canonical-form hook, and the fail-fast validator. Plain asserts — no pytest
-needed.
+plumbing, Sobol/random draws, and — the important one — an EXHAUSTIVE check that
+every one of the 5,544 reachable designs satisfies the app's live security rules
+and that the knob -> design map is injective. That exhaustive pass is what stops
+a bad edit here from silently stalling a participant mid-study: an illegal
+design is accepted from us (Admin SDK bypasses rules) but makes the APP's own
+write illegal, which produces no error on our side at all.
+
+Plain asserts — no pytest needed. The exhaustive pass takes a few seconds.
 """
 
 from __future__ import annotations
@@ -61,8 +66,17 @@ def test_snap_and_normalize_roundtrip():
             assert p.snap(mid) == round(float(p.levels[0]), p.round_ndigits)
 
 
+def test_knob_axes_are_uniform_in_model_space():
+    # The whole point of integer JND knobs: one JND is a CONSTANT distance to the
+    # GP's stationary kernel. A geometric grid of raw values is not (the old
+    # space's intensity grid spanned 0.033 to 0.145 of the [0,1] axis per step).
+    for p in space.CONT_PARAMS:
+        us = [p.normalize(float(lv)) for lv in p.levels]
+        steps = np.diff(us)
+        assert np.allclose(steps, steps[0]), (p.name, steps)
+
+
 def test_encode_decode_roundtrip():
-    # Build an on-grid raw config, encode to a model row, snap back — must match.
     raw = {p.name: round(float(p.levels[len(p.levels) // 2]), p.round_ndigits)
            for p in space.CONT_PARAMS}
     for p in space.CAT_PARAMS:
@@ -73,51 +87,156 @@ def test_encode_decode_roundtrip():
     assert back == raw, (back, raw)
 
 
-def test_canonicalize_constant_pins_dead_dims():
-    # constant = sustained vibration → the app ignores `interval` (stores 1 Hz)
-    # and duration is conceptually infinite (pinned to the grid max), so all
-    # constant configs collapse onto intensity × sharpness.
-    base = {p.name: round(float(p.levels[0]), p.round_ndigits) for p in space.CONT_PARAMS}
-    a = dict(base, pattern="constant", interval=4.0, duration=0.51)
-    b = dict(base, pattern="constant", interval=1.0, duration=12.75)
-    ca = space.canonicalize(a)
-    assert ca["interval"] == 1.0
-    assert ca["duration"] == space.CONSTANT_DURATION == 19.95
-    assert space.obs_key(a) == space.obs_key(b), "same stimulus must share one dedup key"
-    # encoding + snapping goes through the canonical form too
-    snapped = space.snap_candidate(space.to_model_row(a))
-    assert snapped["interval"] == 1.0 and snapped["duration"] == space.CONSTANT_DURATION
-    # "puls" keeps interval and duration untouched
-    c = dict(base, pattern="puls", interval=4.0)
-    assert space.canonicalize(c)["interval"] == 4.0
-    assert space.canonicalize(c)["duration"] == base["duration"]
-    assert space.obs_key(c) != space.obs_key(a)
-    # every proposal path emits canonical configs
-    for i in range(8):
-        for raw in (space.sobol_next(i), space.random_feasible(seed=i)):
-            assert raw == space.canonicalize(raw), f"non-canonical proposal {raw}"
+def test_anchor_reproduces_the_seed_design():
+    # The app team's seed is the origin of the search space AND the study's
+    # baseline arm; if this drifts, every knob vector means something else.
+    assert space.expand(space.anchor()) == space.SEED_DESIGN
+    assert space.rules_valid_haptics(space.SEED_DESIGN)
+    assert set(space.SEED_DESIGN) == set(space.CUES) and len(space.CUES) == 14
+    for burst in space.SEED_DESIGN.values():
+        assert set(burst) == set(space.BURST_KEYS)
 
 
-def test_puls_duration_interval_constraint():
-    # App floors the off-time at 10 ms: a pulse plus that gap must fit 1/interval.
-    base = {p.name: round(float(p.levels[0]), p.round_ndigits) for p in space.CONT_PARAMS}
-    # the app team's own example: 0.5 s pulses @ ~4 Hz render at ~2 Hz -> blocked
-    assert not space.is_feasible(dict(base, pattern="puls", duration=0.51, interval=4.3))
-    assert space.is_feasible(dict(base, pattern="puls", duration=0.03, interval=4.3))
-    # exact boundary stays feasible: 1 Hz -> budget 0.99, grid level 0.99
-    assert space.is_feasible(dict(base, pattern="puls", duration=0.99, interval=1.0))
-    assert not space.is_feasible(dict(base, pattern="puls", duration=1.23, interval=1.0))
-    # "constant" is exempt (no pulses) — its canonical form must be feasible
-    assert space.is_feasible(space.canonicalize(dict(base, pattern="constant")))
-    # projection repairs duration only, keeping the rest of the proposal
-    bad = dict(base, pattern="puls", duration=12.75, interval=4.3)
-    proj = space.project_feasible(bad)
-    assert space.is_feasible(proj)
-    assert proj["duration"] == 0.03 and proj["interval"] == 4.3
-    assert proj["intensity"] == bad["intensity"] and proj["pattern"] == "puls"
-    # feasible configs pass through projection untouched
-    good = dict(base, pattern="puls", duration=0.27, interval=2.074)
-    assert space.project_feasible(good) == good
+def test_every_reachable_design_is_legal_and_unique():
+    """EXHAUSTIVE: all 5,544 knob settings x 14 cues against the live rules."""
+    seen: dict = {}
+    n = 0
+    for knobs in space.all_knob_settings():
+        haptics = space.expand(knobs)
+        n += 1
+        assert space.rules_valid_haptics(haptics), (knobs, haptics)
+        assert set(haptics) == set(space.CUES)
+        for cue, burst in haptics.items():
+            assert set(burst) == set(space.BURST_KEYS), (cue, burst)
+            # `pulseCount is int` in the rules — a float 2.0 is REJECTED there,
+            # and Firestore stores a Python float as a double.
+            assert type(burst["pulseCount"]) is int, (cue, burst)
+            assert burst["pulseCount"] <= burst["onDuration"] * space.MAX_PULSE_RATE_HZ
+        key = space._design_key(haptics)
+        assert key not in seen, f"collision: {knobs} and {seen[key]} render the same design"
+        seen[key] = knobs
+    expected = 1
+    for p in space.CONT_PARAMS:
+        expected *= len(p.levels)
+    assert n == expected == 5544, (n, expected)
+
+
+def test_knobs_recover_from_a_rendered_design():
+    # Needed because we train on what the app ECHOED, not on what we proposed.
+    for knobs in (space.anchor(),
+                  {"gainIntensity": -6.0, "gainSharpness": 3.0,
+                   "gainRate": -8.0, "gainBurstLength": 3.0},
+                  {"gainIntensity": 2.0, "gainSharpness": -3.0,
+                   "gainRate": 2.0, "gainBurstLength": -4.0}):
+        assert space.knobs_from_haptics(space.expand(knobs)) == knobs
+    # a design the knobs cannot produce is reported as unreachable, not guessed
+    tampered = {c: dict(b) for c, b in space.SEED_DESIGN.items()}
+    tampered["turn"]["intensity"] = 0.123
+    assert space.knobs_from_haptics(tampered) is None
+
+
+def test_rules_mirror_rejects_what_the_app_rejects():
+    good = space.SEED_DESIGN["onRoute"]
+    assert space.rules_valid_burst(good)
+    bad_cases = [
+        dict(good, pulseCount=120.0),                  # float, not int64
+        dict(good, pulseCount=True),                   # bool is an int subclass
+        dict(good, pulseCount=0),                      # below the rules minimum
+        dict(good, pulseCount=121),                    # above the rules maximum
+        dict(good, onDuration=0.005),                  # below 0.01 s
+        dict(good, offDuration=2.5),                   # above 2.0 s
+        dict(good, intensity=1.5),                     # outside [0,1]
+        dict(good, sharpness=-0.1),                    # outside [0,1]
+        dict(good, onDuration=0.5),                    # 120 pulses in 0.5 s > 120 Hz
+        {**good, "extra": 1},                          # sixth key: hasOnly() fails
+        {k: v for k, v in good.items() if k != "sharpness"},   # missing key
+    ]
+    for burst in bad_cases:
+        assert not space.rules_valid_burst(burst), burst
+    # a haptics map missing a cue, or carrying an unknown one, must fail too
+    assert not space.rules_valid_haptics({c: space.SEED_DESIGN[c] for c in list(space.CUES)[:13]})
+    assert not space.rules_valid_haptics({**space.SEED_DESIGN, "unknownCue": good})
+
+
+def test_pulse_count_respects_both_caps():
+    # the rate cap, evaluated in the rules' own arithmetic
+    assert space.pulse_count(0.01, 120.0) == 1          # floor(1.2) -> 1
+    assert space.pulse_count(1.0, 120.0) == 120
+    assert space.pulse_count(0.04, 120.0) <= 0.04 * 120  # round() would give 5 > 4.8
+    # the absolute cap binds above 1 s, where rate x on would exceed 120
+    assert space.pulse_count(2.0, 120.0) == 120
+    # never below one pulse
+    assert space.pulse_count(0.01, 0.5) == 1
+    assert type(space.pulse_count(0.5, 60.0)) is int
+
+
+def test_sobol_covers_every_level_uniformly():
+    # Nearest-level snapping would give the two END levels half-width bins, so the
+    # corners of the grid would be drawn half as often as the interior. With only
+    # ten exploration draws in the whole study that is a real coverage loss.
+    from collections import Counter
+    # 32 draws per level is enough: a scrambled Sobol net fills equal-width bins
+    # almost exactly, and the old nearest-level snap gave the end levels HALF
+    # the interior count — a 2x ratio this bound catches with room to spare.
+    for p in space.CONT_PARAMS:
+        n_draws = 32 * len(p.levels)
+        counts = Counter(space.sobol_next(i)[p.name] for i in range(n_draws))
+        assert len(counts) == len(p.levels), (p.name, sorted(counts))
+        lo, hi = min(counts.values()), max(counts.values())
+        assert hi / lo < 1.35, (p.name, dict(sorted(counts.items())))
+
+
+def test_random_feasible_respects_what_was_already_tested():
+    # Every point of this grid is feasible, so without a novelty test the loop
+    # returns its first draw forever and the dedup fallback is a no-op.
+    first = space.random_feasible(seed=5)
+    assert space.random_feasible(seed=5) == first, "should stay deterministic"
+    alt = space.random_feasible(seed=5, exclude={space.obs_key(first)})
+    assert space.obs_key(alt) != space.obs_key(first), "fallback returned a tested design"
+    # excluding (nearly) everything still returns something on-grid rather than hanging
+    everything = {space.obs_key(k) for k in space.all_knob_settings()}
+    assert space.on_grid(space.random_feasible(seed=1, exclude=everything))
+
+
+def test_round_number_coercion():
+    # the rules treat 5.0 == 5 as true, so we do too; nothing else is a round
+    assert space.round_number(5) == 5
+    assert space.round_number(5.0) == 5
+    for bad in (5.5, True, False, "5", None, float("nan")):
+        assert space.round_number(bad) is None, bad
+
+
+def test_decode_knobs_is_the_single_source_of_truth():
+    ours = {"haptics": space.expand({**space.anchor(), "gainRate": -3.0}),
+            "mobo": {"knobs": {**{k: 0 for k in space.KNOB_NAMES}, "gainRate": -3},
+                     "spaceVersion": space.SPACE_VERSION}}
+    knobs, how = space.decode_knobs(ours)
+    assert how == "echo" and knobs == {**space.anchor(), "gainRate": -3.0}
+    # the app team's hand-seeded doc: haptics only, no mobo map -> still decodes
+    seeded = {"haptics": {c: dict(b) for c, b in space.SEED_DESIGN.items()}}
+    assert space.decode_knobs(seeded) == (space.anchor(), "echo")
+    # a result echoing an off-grid design is refused with a reason
+    clamped = {"haptics": {c: dict(b) for c, b in space.SEED_DESIGN.items()}}
+    clamped["haptics"]["turn"]["intensity"] = 0.123
+    knobs, why = space.decode_knobs(clamped, ours)
+    assert knobs is None and "off the knob grid" in why
+    # a proposal from another space version excludes the round, echo or not
+    stale = dict(ours, mobo={**ours["mobo"], "spaceVersion": "v2-old"})
+    knobs, why = space.decode_knobs(seeded, stale)
+    assert knobs is None and "v2-old" in why
+    # no haptics -> stored knobs; off-grid stored knobs -> refused
+    assert space.decode_knobs({"mobo": ours["mobo"]})[1] == "stored"
+    assert space.decode_knobs({"mobo": {"knobs": {**ours["mobo"]["knobs"], "gainRate": 99}}})[0] is None
+
+
+def test_on_grid_guard():
+    assert space.on_grid(space.anchor())
+    assert space.on_grid(space.sobol_next(3))
+    for bad in ({**space.anchor(), "gainRate": 99.0},        # outside the range
+                {**space.anchor(), "gainRate": 0.5},         # between levels
+                {**space.anchor(), "gainRate": "x"},         # not a number
+                {k: v for k, v in space.anchor().items() if k != "gainRate"}):  # missing
+        assert not space.on_grid(bad), bad
 
 
 def test_obs_key_dedup():
@@ -125,6 +244,8 @@ def test_obs_key_dedup():
     assert space.obs_key(raw) == space.obs_key(dict(raw))       # stable
     keys = {space.obs_key(space.sobol_next(i)) for i in range(8)}
     assert len(keys) >= 1                                        # hashable / usable in a set
+    # integer knobs mean the key is exact — no float-rounding near-misses
+    assert space.obs_key({**space.anchor(), "gainRate": -0.0}) == space.obs_key(space.anchor())
 
 
 def test_model_bounds_and_fixed_features():
@@ -139,18 +260,21 @@ def test_model_bounds_and_fixed_features():
 
 
 def test_sobol_and_random_are_on_grid_and_feasible():
-    def on_grid(raw):
-        for p in space.CONT_PARAMS:
-            if not np.any(np.isclose(p.levels, raw[p.name], atol=10 ** -p.round_ndigits)):
-                return False
-        return all(raw[p.name] in p.categories for p in space.CAT_PARAMS)
-
+    # space.on_grid is the guard the service uses. (A local copy with
+    # atol=10**-round_ndigits accepted half-step values on integer knobs.)
     for i in range(12):
         for raw in (space.sobol_next(i), space.random_feasible(seed=i)):
-            assert on_grid(raw), raw
+            assert space.on_grid(raw), raw
             assert space.is_feasible(raw)
     # Sobol is deterministic
     assert space.sobol_next(3) == space.sobol_next(3)
+
+
+def test_budget_fits_the_rules_round_cap():
+    # anchor + 2*(D+1) Sobol rounds must leave room for at least one GP round.
+    assert space.N_SOBOL_DEFAULT == space.N_ANCHOR + 2 * (space.D + 1)
+    assert space.N_SOBOL_DEFAULT < space.MAX_ROUND_NUMBER
+    assert space.MAX_ROUND_NUMBER == 18
 
 
 def test_validator_catches_bad_space():
@@ -169,6 +293,20 @@ def test_validator_catches_bad_space():
     finally:
         space.CONT_PARAMS = saved
         space.PARAM_NAMES = [p.name for p in space.CONT_PARAMS] + [p.name for p in space.CAT_PARAMS]
+
+    # a seed design that violates the app's rules must not import
+    saved_seed = space.SEED_DESIGN
+    try:
+        space.SEED_DESIGN = {c: dict(b) for c, b in saved_seed.items()}
+        space.SEED_DESIGN["turn"]["pulseCount"] = 999
+        try:
+            space._validate()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("validator should reject an illegal SEED_DESIGN")
+    finally:
+        space.SEED_DESIGN = saved_seed
 
 
 def main():

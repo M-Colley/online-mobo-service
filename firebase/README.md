@@ -8,7 +8,7 @@ that glue so the repo is usable end-to-end:
 |------|-----------|
 | `index.js` | The two v2 Firestore triggers: `registerUserOnCreate` → `POST /registerUser`, `updatePolicyOnResult` → `POST /updatePolicy`. |
 | `package.json` | Node 24, firebase-functions v7, firebase-admin v13. |
-| `firestore.indexes.json` | The `pid`+`phaseStep` composite indexes the optimizer's queries need. |
+| `firestore.indexes.json` | **All four** live composite indexes — one the optimizer needs (`interventionResults` `pid`+`phaseStep`) and three the app needs, including `parameterValues(pid, schemaVersion, createdAt DESC)` for its listener. The deploy is declarative: anything missing from this file is **deleted** from the database. |
 
 ## Wiring it up
 

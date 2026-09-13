@@ -6,11 +6,14 @@ Run this to sanity-check the optimizer before deploying:
     python simulate.py
 
 It drives the exact code path Cloud Run uses (space + optimizer_core) for a
-full N_TOTAL-trial run against a synthetic "participant" whose ratings peak at a
-hidden favourite configuration, and asserts:
+full 18-round run against a synthetic "participant" whose ratings peak at a
+hidden favourite knob setting, and asserts:
 
-  • every proposed configuration lies on the JND grid,
-  • no configuration is proposed twice (no sub-JND repeats),
+  • every proposed knob vector lies on the JND grid,
+  • every proposal EXPANDS to a design the app's security rules accept
+    (an illegal design would stall the participant with no error on our side),
+  • no configuration is proposed twice,
+  • round 1 is the anchor (the app team's seed design),
   • the run completes and the hypervolume is non-decreasing.
 """
 
@@ -25,8 +28,9 @@ import optimizer_core as core
 torch.manual_seed(0)
 np.random.seed(0)
 
-N_SOBOL = 2 * (space.D + 1)  # deliberately one more than the memo's 2n+1 (conservative)
-N_TOTAL = N_SOBOL + 5
+N_ANCHOR = space.N_ANCHOR
+N_SOBOL = space.N_SOBOL_DEFAULT          # anchor + 2*(D+1) Sobol draws
+N_TOTAL = space.MAX_ROUND_NUMBER         # the app's rules cap rounds at 18
 
 
 # ── A synthetic participant: two objectives, both maximised in [0,1] ──────────
@@ -49,14 +53,9 @@ def _rate(raw: dict) -> list[float]:
     return [float(subjective), float(objective)]
 
 
-def _on_grid(raw: dict) -> bool:
-    for p in space.CONT_PARAMS:
-        if not np.any(np.isclose(p.levels, raw[p.name], atol=10 ** -p.round_ndigits)):
-            return False
-    for p in space.CAT_PARAMS:
-        if raw[p.name] not in p.categories:
-            return False
-    return True
+# space.on_grid is the guard the SERVICE uses; a local copy with a per-step
+# tolerance accepted half-step values on the integer knobs and could never fire.
+_on_grid = space.on_grid
 
 
 def _hv(Y: torch.Tensor) -> float:
@@ -68,7 +67,8 @@ def _hv(Y: torch.Tensor) -> float:
 
 def main() -> None:
     print(space.describe())
-    print(f"\nBudget: {N_SOBOL} Sobol + {N_TOTAL - N_SOBOL} MOBO = {N_TOTAL} trials")
+    print(f"\nBudget: {N_ANCHOR} anchor + {N_SOBOL - N_ANCHOR} Sobol + "
+          f"{N_TOTAL - N_SOBOL} MOBO = {N_TOTAL} rounds")
     print(f"Hidden favourite: {_FAVOURITE}\n")
 
     history: list[dict] = []
@@ -78,10 +78,14 @@ def main() -> None:
 
     for step in range(1, N_TOTAL + 1):
         obs_count = len(history)
-        if obs_count < N_SOBOL:
-            raw = space.sobol_next(obs_count)
+        if step <= N_ANCHOR:
+            raw = space.anchor()
+            phase = "anchor"
+        elif obs_count < N_SOBOL:
+            # indexed by the ROUND, exactly as main.choose_proposal does
+            raw = space.sobol_next(step - N_ANCHOR - 1)
             if space.obs_key(raw) in observed_keys:
-                raw = space.random_feasible(seed=obs_count)
+                raw = space.random_feasible(seed=step, exclude=observed_keys)
             phase = "sobol"
         else:
             X = torch.tensor(X_rows, dtype=torch.double)
@@ -91,6 +95,11 @@ def main() -> None:
 
         assert _on_grid(raw), f"OFF-GRID candidate proposed: {raw}"
         assert space.obs_key(raw) not in observed_keys, f"DUPLICATE proposed: {raw}"
+        haptics = space.expand(raw)
+        assert space.rules_valid_haptics(haptics), \
+            f"ILLEGAL design (the app could not echo it): {raw} -> {haptics}"
+        if step == 1:
+            assert haptics == space.SEED_DESIGN, "round 1 must be the anchor (seed design)"
 
         y = _rate(raw)
         history.append(raw)
@@ -99,13 +108,16 @@ def main() -> None:
         Y_rows.append(y)
         hv_curve.append(_hv(torch.tensor(Y_rows, dtype=torch.double)))
 
-        print(f"step {step:>2} [{phase:<5}] hv={hv_curve[-1]:.4f}  "
-              f"y=({y[0]:.2f},{y[1]:.2f})  {raw}")
+        onroute = haptics["onRoute"]
+        print(f"step {step:>2} [{phase:<6}] hv={hv_curve[-1]:.4f}  "
+              f"y=({y[0]:.2f},{y[1]:.2f})  knobs={ {k: int(v) for k, v in raw.items()} }  "
+              f"onRoute={onroute['pulseCount']}p/{onroute['onDuration']}s "
+              f"i={onroute['intensity']} s={onroute['sharpness']}")
 
     assert all(b >= a - 1e-9 for a, b in zip(hv_curve, hv_curve[1:])), \
         "hypervolume decreased — MOBO not improving"
-    print(f"\nPASS: {N_TOTAL} trials, all on-grid, all unique, "
-          f"hypervolume non-decreasing (final {hv_curve[-1]:.4f}).")
+    print(f"\nPASS: {N_TOTAL} rounds, all on-grid, all unique, every design legal "
+          f"under the app's rules, hypervolume non-decreasing (final {hv_curve[-1]:.4f}).")
 
 
 if __name__ == "__main__":

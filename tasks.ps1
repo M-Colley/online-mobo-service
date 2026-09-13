@@ -31,7 +31,7 @@ switch ($Task) {
     default {
         Write-Host "Usage: .\tasks.ps1 <task>"
         Write-Host "  describe  print the resolved JND grids"
-        Write-Host "  unit      fast search-space unit tests (sub-second)"
+        Write-Host "  unit      search-space unit tests (~4 s, exhaustive rules check)"
         Write-Host "  test      compile + unit + simulate + full service test"
         Write-Host "  inspect   read-only Firestore inspector (needs auth + GOOGLE_CLOUD_PROJECT)"
         Write-Host "  deploy    gcloud run deploy (set `$env:PROJECT first; region: $Region)"

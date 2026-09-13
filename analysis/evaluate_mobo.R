@@ -5,8 +5,13 @@
 #   Rscript analysis/evaluate_mobo.R [path/to/trials.csv]
 #
 # Input: the CSV produced by analysis/export_firestore.py — one row per
-# completed trial, with the five stimulus parameters, the two objective scores,
-# the optimizer's phase label, and the hypervolume the service wrote back.
+# completed round, with the four optimized KNOBS (integer JND offsets from the
+# app team's seed design), the two objective scores, the optimizer's real phase
+# label, and the hypervolume the service recorded in moboMetrics.
+#
+# The 70 rendered numbers (14 cues x 5 burst values) are NOT in this file — they
+# are in analysis/trials_haptics_long.csv, one row per (round, cue). Any
+# "which cue mattered" analysis has to use that file, not this one.
 #
 # Output: analysis/output/ (figures + tables) and an APA-style console summary.
 #
@@ -34,13 +39,16 @@ suppressPackageStartupMessages({
 #   OBJECTIVES  <- space.py OBJECTIVE_FIELDS (both MAXIMISED, in [0, 1])
 OBJECTIVES <- c("subjectiveScore", "objectiveScore")
 REF_POINT  <- c(-0.1, -0.1)
-N_SOBOL    <- 12
-PARAMS     <- c("intensity", "sharpness", "duration", "interval", "pattern")
+# Rounds 1..N_SOBOL are not model-driven: round 1 is the ANCHOR (the app team's
+# seed design, an unmodified within-participant control) and rounds 2..N_SOBOL
+# are Sobol draws. N_SOBOL = 1 + 2*(D+1) with D = 4.
+N_SOBOL    <- 11
+PARAMS     <- c("gainIntensity", "gainSharpness", "gainRate", "gainBurstLength")
 
-# Parameters that `space.canonicalize()` pins to a sentinel when
-# pattern == "constant" — they are NOT measurements for those rows and must be
-# excluded from any "which parameter mattered" analysis restricted to constant.
-DEAD_FOR_CONSTANT <- c("duration", "interval")
+# WARNING: the app's security rules pin the RESULT doc's `phase` to the literal
+# string "exploration" on every round, so that column says nothing about whether
+# a round was model-driven. Split on `optimizerPhase` (anchor / sobol / mobo /
+# sobol-fallback), which the optimizer records on its own proposal doc.
 
 args    <- commandArgs(trailingOnly = TRUE)
 csv_in  <- if (length(args) >= 1) args[1] else file.path("analysis", "trials.csv")
@@ -96,15 +104,28 @@ if (nrow(out_of_range)) {
 # N_SOBOL cutoff.
 trials <- trials |>
   mutate(
+    optimizerPhase = if ("optimizerPhase" %in% names(raw)) {
+      as.character(optimizerPhase)
+    } else NA_character_,
     Phase = case_when(
-      grepl("^optimi", phase, ignore.case = TRUE) ~ "Optimization",
-      grepl("^explor", phase, ignore.case = TRUE) ~ "Sampling",
-      phaseStep > N_SOBOL                         ~ "Optimization",
-      TRUE                                        ~ "Sampling"
+      grepl("^mobo", optimizerPhase, ignore.case = TRUE)           ~ "Optimization",
+      grepl("^(anchor|sobol)", optimizerPhase, ignore.case = TRUE) ~ "Sampling",
+      phaseStep > N_SOBOL                                          ~ "Optimization",
+      TRUE                                                         ~ "Sampling"
     ),
     Phase = factor(Phase, levels = c("Sampling", "Optimization"))
   ) |>
   arrange(pid, phaseStep)
+
+if (!any(trials$Phase == "Optimization")) {
+  warning("no model-driven rounds in the input — every round was labelled ",
+          "Sampling. If the data do include rounds past N_SOBOL, the ",
+          "`optimizerPhase` column is missing from the CSV (re-export).")
+}
+n_anchor <- sum(grepl("^anchor", trials$optimizerPhase, ignore.case = TRUE),
+                na.rm = TRUE)
+cat("anchor (seed-design) rounds:", n_anchor,
+    "— the expert baseline, repeated identically for every participant\n")
 
 participants <- sort(unique(trials$pid))
 cat("participants:", length(participants), " trials:", nrow(trials), "\n")
@@ -154,6 +175,21 @@ if ("hypervolume" %in% names(trials)) {
   cat("\n")
 }
 
+# The exploration/optimization boundary is a ROUND, not a label: a late
+# `sobol-fallback` round (the GP threw and the service fell back) is labelled
+# Sampling but happens INSIDE the model phase. Taking the last Sampling-labelled
+# row would then credit every earlier model-driven gain to Sampling and silently
+# corrupt hv_gain_optim — the number this script designates as the headline.
+.first_optim_step <- function(step, phase) {
+  s <- step[phase == "Optimization"]
+  if (length(s)) min(s) else Inf
+}
+.hv_before_optim <- function(hv, step, phase) {
+  cutoff <- .first_optim_step(step, phase)
+  before <- hv[step < cutoff]
+  if (length(before)) dplyr::last(before) else 0
+}
+
 # ── 4. Pareto front per participant ──────────────────────────────────────────
 # add_pareto_moocore_column() calls moocore::is_nondominated() with its default
 # maximise = FALSE, so feed it NEGATED objectives to get a maximisation front.
@@ -172,7 +208,7 @@ pareto_summary <- trials |>
     trials       = n(),
     pareto_size  = sum(on_pareto),
     final_hv     = dplyr::last(hv_r),
-    hv_at_sobol  = dplyr::last(hv_r[Phase == "Sampling"]),
+    hv_at_sobol  = .hv_before_optim(hv_r, phaseStep, Phase),
     .groups = "drop"
   ) |>
   mutate(hv_gain_optim = final_hv - hv_at_sobol)
@@ -199,10 +235,10 @@ phase_gain <- trials |>
   group_by(pid) |>
   summarise(
     hv_start   = 0,
-    hv_sobol   = dplyr::last(hv_r[Phase == "Sampling"]),
+    hv_sobol   = .hv_before_optim(hv_r, phaseStep, Phase),
     hv_final   = dplyr::last(hv_r),
-    n_sobol    = sum(Phase == "Sampling"),
-    n_optim    = sum(Phase == "Optimization"),
+    n_sobol    = sum(phaseStep < .first_optim_step(phaseStep, Phase)),
+    n_optim    = sum(phaseStep >= .first_optim_step(phaseStep, Phase)),
     .groups = "drop"
   ) |>
   mutate(
@@ -214,12 +250,24 @@ phase_gain <- trials |>
                       names_to = "Phase", values_to = "hv_gain_per_trial") |>
   mutate(Phase = factor(Phase, levels = c("Sampling", "Optimization")))
 
+if (min(trials |> group_by(pid) |>
+        summarise(n = sum(Phase == "Optimization"), .groups = "drop") |>
+        dplyr::pull(n)) < 1) {
+  cat("NOTE: at least one participant has zero model-driven rounds; the\n",
+      "     Sampling-vs-Optimization test below is skipped for that reason.\n")
+}
 cat("hypervolume gain per trial, by phase\n")
 print(as.data.frame(phase_gain), row.names = FALSE)
 cat("\n")
 write.csv(phase_gain, file.path(out_dir, "phase_gain.csv"), row.names = FALSE)
 
-if (length(participants) >= 3 && all(table(phase_gain$Phase) == length(participants))) {
+# pivot_longer always emits both levels for every participant, so counting rows
+# proves nothing about whether any model-driven round exists. Require that every
+# participant actually HAS one, or this "test" compares Sampling against a
+# column of structural zeros and can report a significant result from nothing.
+n_optim_by_pid <- trials |> group_by(pid) |>
+  summarise(n_optim = sum(Phase == "Optimization"), .groups = "drop")
+if (length(participants) >= 3 && min(n_optim_by_pid$n_optim) >= 1) {
   cat("--- APA report: HV gain per trial, Sampling vs Optimization ---\n")
   try(print(colleyRstats::report_mean_sd(as.data.frame(phase_gain),
                                          iv = "Phase", dv = "hv_gain_per_trial")),
@@ -270,16 +318,15 @@ if (length(have_params)) {
   print(as.data.frame(pareto_cfgs), row.names = FALSE)
   write.csv(pareto_cfgs, file.path(out_dir, "pareto_configs.csv"), row.names = FALSE)
 
-  if ("pattern" %in% have_params) {
-    cat("\npattern share on the Pareto fronts vs overall:\n")
-    print(trials |> group_by(pattern) |>
-            summarise(overall = n(), on_pareto = sum(on_pareto), .groups = "drop") |>
-            mutate(pareto_rate = round(on_pareto / overall, 3)) |> as.data.frame(),
-          row.names = FALSE)
-    cat("\nNOTE: for pattern == \"constant\", space.canonicalize() pins",
-        paste(DEAD_FOR_CONSTANT, collapse = " and "), "to sentinels\n",
-        "(19.95 s and 1 Hz). Those are not measurements — exclude them from any\n",
-        "parameter-effect analysis restricted to constant rows.\n")
+  if (all(PARAMS %in% names(trials))) {
+    cat("\nknob settings on the Pareto fronts (0 = the app team's seed design):\n")
+    print(trials |> filter(on_pareto) |>
+            summarise(across(all_of(PARAMS),
+                             list(median = median, min = min, max = max))) |>
+            as.data.frame(), row.names = FALSE)
+    cat("\nNOTE: a knob value is an integer JND OFFSET from the seed design, not a\n",
+        "stimulus value. The rendered 14-cue designs are in\n",
+        "analysis/trials_haptics_long.csv.\n")
   }
   cat("\n")
 }
@@ -301,7 +348,7 @@ for (obj in OBJECTIVES) {
   p <- try(colleyRstats::plot_mobo2(
     data = as.data.frame(trials), x = "phaseStep", y = obj,
     phaseCol = "Phase",
-    fillColourGroup = if ("pattern" %in% names(trials)) "pattern" else "",
+    fillColourGroup = "",  # no categorical parameter in the knob space
     ytext = obj, horizontalLinePosY = 0.95), silent = TRUE)
   if (!inherits(p, "try-error")) save_fig(p, paste0("mobo_", obj, ".pdf"))
   else cat("  (plot_mobo2 failed for", obj, "- needs both phases present)\n")

@@ -13,4 +13,9 @@ firebase-debug.log
 
 # Study data and generated analysis output (participant data: never commit)
 analysis/trials.csv
-analysis/output/
+analysis/trials_haptics_long.csv
+# any output/ dir: evaluate_mobo.R resolves out_dir against the CWD, so running
+# it from analysis/ writes participant-level CSVs to analysis/analysis/output/
+output/
+trials.csv
+trials_haptics_long.csv

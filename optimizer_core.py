@@ -128,12 +128,9 @@ def choose_next(
     raw = space.project_feasible(raw)  # minimal repair, keeps the model's choice
 
     # The snapped optimum can coincide with a point already tested, or violate a
-    # hard constraint. Fall back to the nearest fresh feasible on-grid config.
+    # hard constraint. Fall back to a fresh feasible on-grid config — the novelty
+    # test lives inside random_feasible(exclude=...), the same one every other
+    # proposal path uses.
     if space.is_feasible(raw) and space.obs_key(raw) not in observed_keys:
         return raw
-
-    for attempt in range(128):
-        cand = space.random_feasible(seed=1_000_000 + dedup_seed * 1000 + attempt)
-        if space.obs_key(cand) not in observed_keys:
-            return cand
-    return raw  # exhausted the grid (only in tiny spaces) — return the duplicate
+    return space.random_feasible(seed=1_000_000 + dedup_seed * 1000, exclude=observed_keys)
