@@ -84,8 +84,8 @@ mediated by Firestore, so the app stays simple and the optimizer stays stateless
  └────────────────────┘                        └───────────────────────────────────┘
 ```
 
-1. App writes a completed trial to `interventionResults` (the params it rendered
-   + the objective scores + an attention-check flag).
+1. App writes a completed trial to `interventionResults` (the design it rendered
+   + the objective scores).
 2. A Cloud Function fires and `POST`s to the service's `/updatePolicy`.
 3. The service reads that participant's full history straight from Firestore,
    computes the next configuration, and writes it to `parameterValues`.
@@ -104,7 +104,7 @@ created by an admin, not by the app.
 | `optimizer_core.py` | Pure GP + `qLogNEHVI` candidate selection. No Firestore — unit-testable. |
 | `main.py` | Flask service: Firestore I/O, idempotency, hypervolume logging, HTTP endpoints. |
 | `simulate.py` | Offline optimizer loop against a synthetic participant (asserts on-grid, unique, HV rises). |
-| `tests/test_service.py` | Full HTTP service against an in-memory Firestore fake (register → N trials → done, dedup, attention-check exclusion). |
+| `tests/test_service.py` | Full HTTP service against an in-memory Firestore fake (register → 18 rounds → done, dedup, discarded rounds, the seeded round-1 doc, exporter/optimizer agreement). |
 | `tests/test_space.py` | Unit tests for the search-space logic (no GP fitting; ~5 s, including an exhaustive pass of every reachable design against the app's rules). |
 | `inspect_db.py` | Read-only Firestore inspector — document shape, observed ranges, every burst against the rules mirror, and the app's own listener query. **Run it first** whenever the app team says the parameters changed. |
 | `firebase/` | Reference copies of the Cloud Functions glue + Firestore indexes (see its README). |
@@ -543,9 +543,11 @@ which is **first-wins and the only real guard** — the per-user `threading.Lock
 lives in one Python process while Cloud Run autoscales, so it serializes
 same-user requests only *within* an instance, and the read-then-create check is
 a cross-instance TOCTOU window. Duplicate Cloud Function deliveries are detected
-and skipped. Failed attention checks (`attentionCheckPassed == false`) are
-excluded from the training data but **still consume their round**, because the
-app's rules pin `phaseStep == roundNumber`.
+and skipped. A round whose result is unusable (an off-grid echo, a stale
+`spaceVersion`) is excluded from the training data but **still consumes its
+round**, because the app's rules pin `phaseStep == roundNumber`. The app has no
+attention checks since 2026-09-17; a legacy result explicitly marked
+`attentionCheckPassed: false` is treated the same way.
 
 ## Troubleshooting
 
@@ -566,7 +568,10 @@ app's rules pin `phaseStep == roundNumber`.
 ## Data contract with the app
 
 The authoritative contract is the app team's Firestore **security rules** (ruleset
-`42691aae`, released 2026-09-08). They validate the app's own writes, so a design
+`6700114d`, released 2026-09-17; byte-exact copy in
+[`firebase/app-rules-snapshot.txt`](firebase/app-rules-snapshot.txt), and
+`inspect_db.py` CHECK 0 reports when the live rules drift from it). They
+validate the app's own writes, so a design
 this service writes that violates them is accepted from us (the Admin SDK bypasses
 rules) and then makes the *app's* result write illegal — which produces no error
 on our side at all. `space.rules_valid_burst()` mirrors the predicate and
@@ -577,9 +582,12 @@ on our side at all. `space.rules_valid_burst()` mirrors the predicate and
   `isFinalRound`, `createdAt`, the 14-cue `haptics` map, and a `mobo` map holding
   the knob vector, the real optimizer phase and the `spaceVersion`.
 - App writes `interventionResults/{id}` echoing the design it rendered, plus
-  `pid`, `phaseStep` == `roundNumber`, both objective fields,
-  `attentionCheckPassed`, `touchedTarget`, `parameterDocumentId`, `candidateId`,
-  `sessionId`, `mapName`, `authUid`, `resultId`.
+  `pid`, `phaseStep` == `roundNumber`, both objective fields, `touchedTarget`,
+  `parameterDocumentId`, `candidateId`, `sessionId`, `mapName`, `authUid`,
+  `resultId`. The app copies `phase`, `candidateId`, `schemaVersion` and
+  `phaseStep` from our proposal verbatim, and echoes the design it *delivered*.
+- Round 1 is seeded **by the app team** (an auto-id doc per participant); the
+  service recognises it and writes rounds 2–18.
 - Service writes the anytime hypervolume to `moboMetrics/{pid}_step_N` — **never**
   into the app's own doc, whose rules permit a client update only for a retry that
   changes nothing but `createdAt`.

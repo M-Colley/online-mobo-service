@@ -41,13 +41,58 @@ PROPOSALS = "parameterValues"
 METRICS = "moboMetrics"
 USERS = "users"
 
-# Exactly what the app's validResult() rule requires on every result doc.
+# Exactly what the app's validResult() rule requires on every result doc
+# (ruleset 6700114d — attentionCheckPassed was dropped on 2026-09-17).
 REQUIRED_RESULT_FIELDS = [
     "authUid", "pid", "resultId", "sessionId", "parameterDocumentId", "candidateId",
     "mapName", "createdAt", "schemaVersion", "hapticMode", "phase", "phaseStep",
-    "roundNumber", "subjectiveScore", "objectiveScore", "attentionCheckPassed",
-    "touchedTarget", "haptics",
+    "roundNumber", "subjectiveScore", "objectiveScore", "touchedTarget", "haptics",
 ]
+
+RULES_SNAPSHOT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "firebase", "app-rules-snapshot.txt")
+
+
+def check_live_rules():
+    """CHECK 0 — have the app team's live rules drifted from our snapshot?
+
+    The rules ARE the contract, and they change without notice (attention checks
+    vanished from validResult on 2026-09-17 with no code change on our side).
+    Best effort: needs the Firebase Rules API readable with your ADC.
+    """
+    import difflib
+    print("\nCHECK 0 — live security rules vs firebase/app-rules-snapshot.txt")
+    try:
+        import google.auth
+        from google.auth.transport.requests import AuthorizedSession
+        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        session = AuthorizedSession(creds)
+        headers = {"X-Goog-User-Project": PROJECT_ID}
+        api = "https://firebaserules.googleapis.com/v1"
+        rel = session.get(f"{api}/projects/{PROJECT_ID}/releases", headers=headers, timeout=30)
+        rel.raise_for_status()
+        release = next(r for r in rel.json().get("releases", [])
+                       if r["name"].endswith("/cloud.firestore"))
+        rs = session.get(f"{api}/{release['rulesetName']}", headers=headers, timeout=30)
+        rs.raise_for_status()
+        live = "".join(f["content"] for f in rs.json()["source"]["files"])
+    except Exception as e:  # noqa: BLE001 — advisory check, never fatal
+        print(f"    (could not read the live rules: {type(e).__name__}: {e}) — skipped")
+        return
+    with open(RULES_SNAPSHOT, encoding="utf-8") as fh:
+        snap = fh.read()
+    ruleset = release["rulesetName"].rsplit("/", 1)[-1]
+    live_n, snap_n = live.replace("\r\n", "\n"), snap.replace("\r\n", "\n")
+    if live_n == snap_n:
+        print(f"    identical (live ruleset {ruleset}, released {release.get('updateTime')})")
+        return
+    print(f"    DRIFT: live ruleset {ruleset} (released {release.get('updateTime')}) differs:")
+    diff = difflib.unified_diff(snap_n.splitlines(), live_n.splitlines(),
+                                "snapshot", "live", lineterm="")
+    for line in list(diff)[:40]:
+        print("      " + line)
+    print("    ^ update the snapshot, then run tests/test_space.py — it fails if")
+    print("      space.py's rules mirror no longer matches what the app enforces.")
 
 
 def scan(db, collection):
@@ -80,6 +125,8 @@ def main():
     print(f"this service expects: schemaVersion {space.SCHEMA_VERSION}, "
           f"{len(space.CUES)} cues x {len(space.BURST_KEYS)} burst fields, "
           f"rounds <= {space.MAX_ROUND_NUMBER}, spaceVersion {space.SPACE_VERSION}")
+
+    check_live_rules()
 
     results = scan(db, RESULTS)
     proposals = scan(db, PROPOSALS)

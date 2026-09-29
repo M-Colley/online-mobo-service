@@ -8,8 +8,11 @@ is optimised is an edit to this file; changing the WIRE FORMAT (how a design is
 written to Firestore) also lives here, in expand() / SEED_DESIGN.
 ────────────────────────────────────────────────────────────────────────────
 
-What the app actually expects (contract, ruleset 42691aae, released 2026-09-08)
+What the app actually expects (contract, ruleset 6700114d, released 2026-09-17)
 ------------------------------------------------------------------------------
+(A byte-exact copy lives in firebase/app-rules-snapshot.txt; tests/test_space.py
+fails if the mirror below stops matching it, and inspect_db.py CHECK 0 reports
+when the LIVE rules drift from the copy.)
 One candidate is NOT five flat fields. It is a nested `haptics` map of
 **14 navigation cues x 5 burst values = 70 numbers**, written on a
 `parameterValues` doc that also declares `schemaVersion: 2` and a `candidateId`.
@@ -352,7 +355,7 @@ def expand(knobs: dict) -> dict:
     return haptics
 
 
-# ── Rules mirror: validBurst() / validHaptics() from ruleset 42691aae ────────
+# ── Rules mirror: validBurst() / validHaptics() from ruleset 6700114d ────────
 # A LITERAL mirror — no epsilon. The rule is a hard predicate evaluated on the
 # written doubles; slack here would let through a design the app cannot echo.
 def rules_valid_burst(burst) -> bool:

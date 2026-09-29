@@ -5,7 +5,7 @@ Firestore-mediated, same as before:
   app -> interventionResults -> Cloud Function -> POST /updatePolicy -> here,
   here -> parameterValues -> app snapshot listener.
 
-What a document looks like now (contract, ruleset 42691aae — see space.py):
+What a document looks like now (contract, ruleset 6700114d — see space.py):
 a candidate is a nested `haptics` map of 14 navigation cues x 5 burst values,
 carried on a doc that declares `schemaVersion: 2`, a `candidateId`, and the
 literal `phase: "exploration"`. The optimizer's own state (the knob vector and
@@ -142,7 +142,7 @@ class Proposals:
     result -> proposal join, the "does this step already exist" check, and the
     set of designs already ISSUED — which is the novelty set. Issued, not
     observed: a round whose result was unusable (an off-grid echo, a stale
-    spaceVersion, a failed attention check) was still FELT by the participant,
+    spaceVersion) was still FELT by the participant,
     and re-issuing it is what turns one bad round into a run of identical stimuli.
     Decoded with space.decode_knobs, so the app team's hand-seeded auto-id doc
     (haptics only, no `mobo` map) counts too.
@@ -240,6 +240,9 @@ def load_observations(user_id: str, proposals: Proposals):
             continue
         # Count the round FIRST: a discarded round still consumed a roundNumber.
         rounds_done = max(rounds_done, step)
+        # The app dropped attention checks (ruleset 6700114d, 2026-09-17): results
+        # no longer carry the field, and absent means usable. A LEGACY doc that
+        # explicitly says False is still kept out of training; its round counts.
         if d.get("attentionCheckPassed") is False:
             continue
         if step in seen_steps:

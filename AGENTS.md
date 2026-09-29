@@ -55,7 +55,9 @@ Sobol (`2·(D+1)` draws), rounds 12–18 are GP `qLogNEHVI`.
    the GP takes over on usable observations, so every discarded round shortens
    the model phase by one (logged as `has N rounds but only M usable observations`).
 4. **Never deploy `firestore:rules`.** The app team owns the live security rules
-   (ruleset `42691aae`, released 2026-09-08); a blind deploy overwrites them.
+   (ruleset `6700114d`, released 2026-09-17; byte-exact copy in
+   `firebase/app-rules-snapshot.txt` — a snapshot, never deployed); a blind
+   deploy overwrites them.
    Note this protection is **procedural, not structural**: there is no
    `firebase.json` in this repository at all, so the deploy runs from whatever
    external `firebase-deploy/` directory you built — check *that* copy before
@@ -115,7 +117,7 @@ think you deployed is the one running.
 | Collection | Written by | Must contain |
 |-----------|-----------|--------------|
 | `users/{pid}` | **an admin** | clients cannot write here (rules deny it), so `registerUserOnCreate` only fires for an Admin SDK / console create |
-| `interventionResults/{id}` | app | `pid`, `phaseStep` == `roundNumber` (1–18), `attentionCheckPassed`, `touchedTarget`, `parameterDocumentId`, `candidateId`, `sessionId`, `mapName`, `authUid`, `resultId`, `schemaVersion` 2, `hapticMode` `'burst'`, `phase` `'exploration'`, both `space.OBJECTIVE_FIELDS`, and the echoed 14-cue `haptics` map |
+| `interventionResults/{id}` | app | `pid`, `phaseStep` == `roundNumber` (1–18), `touchedTarget`, `parameterDocumentId`, `candidateId`, `sessionId`, `mapName`, `authUid`, `resultId`, `schemaVersion` 2, `hapticMode` `'burst'`, `phase` `'exploration'`, both `space.OBJECTIVE_FIELDS`, and the echoed 14-cue `haptics` map |
 | `parameterValues/{pid}_step_N` | this service | `schemaVersion` 2, `candidateId`, `phase` `'exploration'`, `phaseStep`/`roundNumber`, `isFinalRound`, the `haptics` map, and a `mobo` map holding the knobs + the real phase |
 | `moboMetrics/{pid}_step_N` | this service | the anytime hypervolume. **Never annotate the app's own docs** — their rules allow a client update only for a retry that changes nothing but `createdAt`. |
 
@@ -168,33 +170,42 @@ from `isFinalRound` on the last proposal.
   counter the moment a round is discarded, and the service then re-proposes a
   step whose doc already exists — `{"skipped": true}` forever.
 
+## Settled with the app team
+
+Myles Thornell Timmer (WAIVE Lab, GVSU) confirmed on **2026-09-17**:
+
+1. **The app team seeds round 1 by hand** (an auto-id `parameterValues` doc, as
+   for pid 101); the optimizer takes over from round 2. Nobody creates
+   `users/{pid}`, so `registerUserOnCreate` only fires on our own completion
+   write — where `study_completed()` makes it a no-op.
+2. The app copies `phase`, `candidateId`, `schemaVersion`, `phaseStep` from our
+   proposal onto its result **verbatim** — hence `phase` is always `'exploration'`.
+3. Extra proposal fields (`mobo`, `isFinalRound`) are harmless: `validResult` is
+   not key-exact (asserted against the snapshot in `tests/test_space.py`).
+4. The listener takes the **newest** doc for the pid with `schemaVersion == 2`;
+   the app learns the study is over from `isFinalRound` on round 18.
+5. **No attention checks.** Dropped from `validResult` in ruleset `6700114d`; the
+   app never repeats a round, so `firebase/index.js` forwards every result. A
+   legacy result explicitly marked `false` is still excluded from training.
+6. The echoed `haptics` is what was **delivered** — that is what we train on.
+7. All 18 rounds happen in **one session**, and **maps vary** between rounds —
+   so map difficulty and route learning are nuisance factors the analysis must
+   model (`mapName`, round index); the optimizer sees them as noise.
+
+Burst semantics were confirmed 2026-09-11 (see Traps).
+
 ## Open questions
 
-Answered 2026-09-11: the burst semantics (see Traps). Still open with the app
-team, in rough order of how badly they block:
-
-1. Who creates `users/{pid}` and who writes round 1? The rules deny client writes
-   to `users/`, so the registration trigger can only fire from an admin.
-2. Does the app copy `phase` / `candidateId` / `schemaVersion` from our proposal
-   onto its result doc?
-3. Is `validResult` `hasAll` or `hasOnly`? We add root fields (`mobo`,
-   `isFinalRound`) to the proposal doc that a key-exact rule would reject if
-   the app echoed them. (`roundNumber` is required by the rules, not extra.)
-4. What exactly does the app's listener query? (A live composite index on
-   `pid + schemaVersion + createdAt DESC` implies it, but an index only proves
-   some query existed.)
-5. Does a cue loop, and what stops it? Decides whether `offDuration` is a live
-   dimension or dead weight.
-6. Is the echoed burst what was *proposed* or what was *delivered* (post-clamp)?
-7. **After a failed attention check, does the app REPEAT round k (same
-   `roundNumber`, same design) or advance to k+1?** `firebase/index.js` never
-   calls the optimizer for a failed result ("step repeated"), so the service's
-   round counter is only reached through the passing repeat. Consistent if the
-   app repeats; a silent stall at round k if it advances. Neither is verified.
-8. Can the questionnaire produce a per-cue rating? This is the highest-value
-   question in the list — it would turn one round into up to 14 observations and
-   make per-cue personalization statistically defensible instead of
-   budget-forced.
+- What do `subjectiveScore`, `objectiveScore` and `touchedTarget` measure now?
+  (asked 2026-09-17, unanswered)
+- Could the four cues seeded at `sharpness 1.0` (`start`, `end`,
+  `onRouteSidewalk`, `onRouteCrosswalk`) be seeded at ~0.85 to give the
+  sharpness knob headroom? (asked, unanswered)
+- Can the questionnaire produce a per-cue rating? Not asked yet. It is the
+  highest-value question left — it would turn one round into up to 14
+  observations and make per-cue personalization defensible.
+- Does a cue loop until the navigation state changes? Not asked in the sent
+  email; `offDuration` is held at the seed values until it is.
 
 Two knob step sizes are placeholders with no psychophysical basis:
 `gainSharpness` (0.20 additive) and `gainBurstLength` (×1.25). The

@@ -70,11 +70,11 @@ exports.updatePolicyOnResult = onDocumentCreated(
       return;
     }
 
-    // Attention check failed → ignore this result, repeat the same step
-    if (data.attentionCheckPassed === false) {
-      console.log(`[${userId}] Attention check failed — skipping optimizer, step repeated.`);
-      return;
-    }
+    // No attention-check short-circuit any more: the app dropped attention
+    // checks (ruleset 6700114d, 2026-09-17) and never repeats a round, so EVERY
+    // result must reach the optimizer or the participant waits forever for the
+    // next design. (A legacy result explicitly marked attentionCheckPassed:false
+    // is still forwarded; the service excludes it from training itself.)
 
     // The optimizer reads all fields directly from Firestore (Admin SDK).
     // We only need to tell it which user triggered the update.

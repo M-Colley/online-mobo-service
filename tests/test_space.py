@@ -158,6 +158,47 @@ def test_rules_mirror_rejects_what_the_app_rejects():
     assert not space.rules_valid_haptics({**space.SEED_DESIGN, "unknownCue": good})
 
 
+def test_rules_mirror_matches_the_app_teams_rules():
+    # firebase/app-rules-snapshot.txt is a byte-exact copy of the live ruleset.
+    # If the app team changes a bound and someone refreshes the snapshot, this is
+    # the test that says space.py's mirror is now wrong — BEFORE a participant
+    # stalls on a design the app can no longer echo.
+    import re
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "firebase", "app-rules-snapshot.txt")
+    with open(path, encoding="utf-8") as fh:
+        rules = fh.read()
+
+    def bound(field, op):
+        m = re.search(r"profile\." + field + r"\s*" + op + r"\s*([0-9.]+)", rules)
+        assert m, f"no `{field} {op} <number>` clause in the rules"
+        return float(m.group(1))
+
+    def key_list(owner):
+        m = re.search(owner + r"\.keys\(\)\.hasOnly\(\[(.*?)\]\)", rules, re.S)
+        assert m, f"no {owner}.keys().hasOnly([...]) clause in the rules"
+        return set(re.findall(r"'(\w+)'", m.group(1)))
+
+    assert (bound("intensity", ">="), bound("intensity", "<=")) == (space.INTENSITY_MIN, space.INTENSITY_MAX)
+    assert (bound("sharpness", ">="), bound("sharpness", "<=")) == (space.SHARPNESS_MIN, space.SHARPNESS_MAX)
+    assert (bound("pulseCount", ">="), bound("pulseCount", "<=")) == (space.PULSE_COUNT_MIN, space.PULSE_COUNT_MAX)
+    for field in ("onDuration", "offDuration"):
+        assert (bound(field, ">="), bound(field, "<=")) == (space.DURATION_MIN, space.DURATION_MAX), field
+    rate = re.search(r"profile\.pulseCount\s*<=\s*profile\.onDuration\s*\*\s*([0-9.]+)", rules)
+    assert rate and float(rate.group(1)) == space.MAX_PULSE_RATE_HZ
+    assert "profile.pulseCount is int" in rules
+    assert key_list("profile") == set(space.BURST_KEYS)
+    assert key_list("haptics") == set(space.CUES)
+    assert f"data.schemaVersion == {space.SCHEMA_VERSION}" in rules
+    assert f"data.hapticMode == '{space.HAPTIC_MODE}'" in rules
+    assert f"data.phase == '{space.WIRE_PHASE}'" in rules
+    assert f"data.roundNumber <= {space.MAX_ROUND_NUMBER}" in rules
+    # Myles confirmed (2026-09-17) that our extra proposal fields are harmless
+    # because results are NOT key-exact. If that ever changes, echoing `mobo` or
+    # `isFinalRound` would make every result write illegal.
+    assert "data.keys().hasOnly" not in rules, "validResult became key-exact"
+
+
 def test_pulse_count_respects_both_caps():
     # the rate cap, evaluated in the rules' own arithmetic
     assert space.pulse_count(0.01, 120.0) == 1          # floor(1.2) -> 1

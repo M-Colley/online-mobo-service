@@ -21,8 +21,9 @@ and asserts the things that would otherwise stall a real participant SILENTLY:
     int and exactly 5 keys x 14 cues,
   • no proposal exceeds roundNumber 18,
   • round 1 is the anchor (the app team's seed design),
-  • steps are contiguous, duplicate deliveries are suppressed, failed attention
-    checks are excluded from training but still consume their round,
+  • steps are contiguous, duplicate deliveries are suppressed, and a round whose
+    result is unusable is excluded from training but still consumes its round
+    (the app has no attention checks since 2026-09-17; results omit the field),
   • the study completes at exactly N_TOTAL and a completed participant cannot be
     re-seeded by the registration trigger.
 """
@@ -177,10 +178,14 @@ def _assert_proposal_is_sane(doc: dict, step: int, ctx: str):
 
 
 def _result_doc(uid: str, proposal: dict, step: int, subj: float, obj: float,
-                attention: bool = True) -> dict:
-    """An interventionResults doc in exactly the shape the app's rules demand."""
-    rid = f"{uid}_r{step}" if attention else f"{uid}_r{step}_failed"
-    return {
+                attention: bool | None = None) -> dict:
+    """An interventionResults doc in exactly the shape the app's rules demand.
+
+    `attention=None` (the default) omits attentionCheckPassed, as the app has done
+    since ruleset 6700114d; True/False build a LEGACY doc for the tolerance tests.
+    """
+    rid = f"{uid}_r{step}" if attention is not False else f"{uid}_r{step}_failed"
+    doc = {
         "authUid": f"auth_{uid}",
         "pid": uid,
         "resultId": rid,
@@ -196,10 +201,19 @@ def _result_doc(uid: str, proposal: dict, step: int, subj: float, obj: float,
         "roundNumber": step,
         "subjectiveScore": subj,
         "objectiveScore": obj,
-        "attentionCheckPassed": attention,
         "touchedTarget": True,
         "haptics": {c: dict(b) for c, b in proposal["haptics"].items()},
     }
+    if attention is not None:
+        doc["attentionCheckPassed"] = attention
+    return doc
+
+
+def _clamped(doc: dict) -> dict:
+    """The same result, but the app 'delivered' an off-grid value (a clamp)."""
+    doc = {**doc, "haptics": {c: dict(b) for c, b in doc["haptics"].items()}}
+    doc["haptics"]["turn"]["intensity"] = 0.123
+    return doc
 
 
 # ── The test ──────────────────────────────────────────────────────────────────
@@ -242,11 +256,6 @@ def run() -> None:
         key = space.obs_key(knobs)
         assert key not in seen, f"step_{step}: duplicate design {knobs}"
         seen.add(key)
-
-        # a failed attention check mid-study must be ignored by the optimizer
-        if step == 3:
-            fake.collection("interventionResults").document(f"{uid}_r3_failed").create(
-                _result_doc(uid, doc, step, 0.0, 0.0, attention=False))
 
         subj, obj = _rate(knobs)
         fake.collection("interventionResults").document(f"{uid}_r{step}").create(
@@ -316,8 +325,7 @@ def run() -> None:
     print(f"\nPASS: full HTTP loop, {main.N_TOTAL} rounds "
           f"({main.N_ANCHOR} anchor + {main.N_SOBOL - main.N_ANCHOR} Sobol + "
           f"{main.N_TOTAL - main.N_SOBOL} MOBO), every design legal under the app's "
-          f"rules, duplicates suppressed, failed attention check excluded, "
-          f"studyCompleted set.")
+          f"rules, duplicates suppressed, studyCompleted set.")
 
 
 def run_discarded_round_keeps_the_counter() -> None:
@@ -338,14 +346,14 @@ def run_discarded_round_keeps_the_counter() -> None:
         _result_doc(uid, p1, 1, 0.5, 0.5))
     client.post("/updatePolicy", json={"userId": uid, "type": "interventionResult"})
 
-    # round 2 comes back with a failed attention check only — no usable data
+    # round 2 comes back unusable: the app delivered an off-grid (clamped) design
     p2 = fake.collection("parameterValues")._store[f"{uid}_step_2"]
-    fake.collection("interventionResults").document(f"{uid}_r2_failed").create(
-        _result_doc(uid, p2, 2, 0.0, 0.0, attention=False))
+    fake.collection("interventionResults").document(f"{uid}_r2").create(
+        _clamped(_result_doc(uid, p2, 2, 0.0, 0.0)))
     r = client.post("/updatePolicy", json={"userId": uid, "type": "interventionResult"}).get_json()
 
     assert r["roundsDone"] == 2, f"roundsDone={r['roundsDone']} — a discarded round must still count"
-    assert r["obsCount"] == 1, f"obsCount={r['obsCount']} — the failed round must not train the GP"
+    assert r["obsCount"] == 1, f"obsCount={r['obsCount']} — the unusable round must not train the GP"
     assert r["nextPhaseStep"] == 3, f"nextPhaseStep={r['nextPhaseStep']} — would collide with step 2"
     p3 = fake.collection("parameterValues")._store.get(f"{uid}_step_3")
     assert p3 is not None
@@ -353,6 +361,12 @@ def run_discarded_round_keeps_the_counter() -> None:
     # observation count would hand out step 2's design again here.
     assert p3["mobo"]["knobs"] != p2["mobo"]["knobs"], \
         "step 3 re-issued step 2's design — the exploration pointer is pinned"
+    # LEGACY tolerance: a result explicitly marked attentionCheckPassed:false (an
+    # old app build) is not trained on, but its round still counts.
+    fake.collection("interventionResults").document(f"{uid}_r3_failed").create(
+        _result_doc(uid, p3, 3, 0.0, 0.0, attention=False))
+    r = client.post("/updatePolicy", json={"userId": uid, "type": "interventionResult"}).get_json()
+    assert r["roundsDone"] == 3 and r["obsCount"] == 1 and r["nextPhaseStep"] == 4, r
     print("PASS: a discarded round advances both the round counter and the design.")
 
 
@@ -466,11 +480,11 @@ def run_seeded_round_one_is_in_the_novelty_set() -> None:
     r = client.post("/registerUser", json={"userId": uid}).get_json()
     assert r.get("skipped"), "must not write a competing round-1 design"
     assert f"{uid}_step_1" not in fake.collection("parameterValues")._store
-    # round 1 fails the attention check: no observation, but the design WAS felt
+    # round 1's result is unusable (clamped echo): no observation, but the design WAS felt
     seed_doc = fake.collection("parameterValues")._store["XmNWlxIjB4sGrle1ehBk"]
-    fake.collection("interventionResults").document(f"{uid}_r1_failed").create(
-        {**_result_doc(uid, {**seed_doc, "candidateId": seed_doc["candidateId"]}, 1, 0.0, 0.0,
-                       attention=False), "parameterDocumentId": "XmNWlxIjB4sGrle1ehBk"})
+    fake.collection("interventionResults").document(f"{uid}_r1").create(
+        {**_clamped(_result_doc(uid, seed_doc, 1, 0.0, 0.0)),
+         "parameterDocumentId": "XmNWlxIjB4sGrle1ehBk"})
     assert space.obs_key(space.anchor()) in main.Proposals(uid).issued, \
         "the seeded anchor is not in the novelty set"
     r = client.post("/updatePolicy", json={"userId": uid, "type": "interventionResult"}).get_json()
@@ -517,9 +531,12 @@ def run_exporter_matches_the_optimizer() -> None:
     prop["createdAt"] = "x"
     by_id = {f"{uid}_step_2": prop}
     by_step = {(uid, 2): prop}
+    # LEGACY pair: an explicit attentionCheckPassed:false doc next to a current
+    # result that omits the field. The failed doc streams first (doc ids are the
+    # app's resultIds — any order) and must not shadow the usable one.
     failed = _result_doc(uid, prop, 2, 0.1, 0.1, attention=False)
     passed = _result_doc(uid, prop, 2, 0.9, 0.9)
-    # the FAILED doc streams first (doc ids are the app's resultIds — any order)
+    assert "attentionCheckPassed" not in passed
     rows, long_rows, skipped, _ = export.build_rows(
         [("a_failed", failed), ("b_passed", passed)], by_id, by_step, {})
     kept = {(r["phaseStep"], r["attentionCheckPassed"]) for r in rows}

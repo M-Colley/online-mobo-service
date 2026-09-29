@@ -1,0 +1,150 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function validBurst(profile) {
+      return profile is map
+        && profile.keys().hasAll([
+          'intensity', 'sharpness', 'pulseCount', 'onDuration', 'offDuration'
+        ])
+        && profile.keys().hasOnly([
+          'intensity', 'sharpness', 'pulseCount', 'onDuration', 'offDuration'
+        ])
+        && profile.intensity is number
+        && profile.intensity >= 0
+        && profile.intensity <= 1
+        && profile.sharpness is number
+        && profile.sharpness >= 0
+        && profile.sharpness <= 1
+        && profile.pulseCount is int
+        && profile.pulseCount >= 1
+        && profile.pulseCount <= 120
+        && profile.onDuration is number
+        && profile.onDuration >= 0.01
+        && profile.onDuration <= 2.0
+        && profile.pulseCount <= profile.onDuration * 120
+        && profile.offDuration is number
+        && profile.offDuration >= 0.01
+        && profile.offDuration <= 2.0;
+    }
+
+    function validHaptics(haptics) {
+      return haptics is map
+        && haptics.keys().hasAll([
+          'start',
+          'onRoute',
+          'offRoute',
+          'onRouteIntersection',
+          'offRouteIntersection',
+          'landmark',
+          'end',
+          'street',
+          'onRouteSidewalk',
+          'offRouteSidewalk',
+          'onRouteCrosswalk',
+          'offRouteCrosswalk',
+          'turn',
+          'intersectionCenter'
+        ])
+        && haptics.keys().hasOnly([
+          'start',
+          'onRoute',
+          'offRoute',
+          'onRouteIntersection',
+          'offRouteIntersection',
+          'landmark',
+          'end',
+          'street',
+          'onRouteSidewalk',
+          'offRouteSidewalk',
+          'onRouteCrosswalk',
+          'offRouteCrosswalk',
+          'turn',
+          'intersectionCenter'
+        ])
+        && validBurst(haptics.start)
+        && validBurst(haptics.onRoute)
+        && validBurst(haptics.offRoute)
+        && validBurst(haptics.onRouteIntersection)
+        && validBurst(haptics.offRouteIntersection)
+        && validBurst(haptics.landmark)
+        && validBurst(haptics.end)
+        && validBurst(haptics.street)
+        && validBurst(haptics.onRouteSidewalk)
+        && validBurst(haptics.offRouteSidewalk)
+        && validBurst(haptics.onRouteCrosswalk)
+        && validBurst(haptics.offRouteCrosswalk)
+        && validBurst(haptics.turn)
+        && validBurst(haptics.intersectionCenter);
+    }
+
+    function validResult(data) {
+      return data.authUid is string
+        && data.pid is string
+        && data.resultId is string
+        && data.sessionId is string
+        && data.parameterDocumentId is string
+        && data.candidateId is string
+        && data.mapName is string
+        && data.createdAt is timestamp
+        && data.schemaVersion == 2
+        && data.hapticMode == 'burst'
+        && data.phase == 'exploration'
+        && data.phaseStep is int
+        && data.roundNumber is int
+        && data.roundNumber >= 1
+        && data.roundNumber <= 18
+        && data.phaseStep == data.roundNumber
+        && data.subjectiveScore is number
+        && data.subjectiveScore >= 0
+        && data.subjectiveScore <= 1
+        && data.objectiveScore is number
+        && data.objectiveScore >= 0
+        && data.objectiveScore <= 1
+        && data.touchedTarget is bool
+        && validHaptics(data.haptics);
+    }
+
+    match /parameterValues/{documentId} {
+      // The iOS app reads optimizer output but cannot create or alter it.
+      // A trusted MOBO Admin SDK is controlled by IAM and bypasses these rules.
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
+    match /interventionResults/{documentId} {
+      // A participant can create its own valid result at a deterministic path.
+      allow create: if signedIn()
+        && validResult(request.resource.data)
+        && request.resource.data.authUid == request.auth.uid
+        && request.resource.data.resultId == documentId;
+
+      // Retrying an ambiguous network write replaces the same logical result,
+      // but cannot change its owner, candidate, round, or tested haptic values.
+      allow update: if signedIn()
+        && validResult(request.resource.data)
+        && resource.data.authUid == request.auth.uid
+        && request.resource.data.authUid == resource.data.authUid
+        && request.resource.data.resultId == resource.data.resultId
+        && request.resource.data.resultId == documentId
+        && request.resource.data.pid == resource.data.pid
+        && request.resource.data.sessionId == resource.data.sessionId
+        && request.resource.data.roundNumber == resource.data.roundNumber
+        && request.resource.data.parameterDocumentId == resource.data.parameterDocumentId
+        && request.resource.data.candidateId == resource.data.candidateId
+        && request.resource.data.haptics == resource.data.haptics
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['createdAt']);
+
+      allow read, delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

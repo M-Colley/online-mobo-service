@@ -8,6 +8,7 @@ that glue so the repo is usable end-to-end:
 |------|-----------|
 | `index.js` | The two v2 Firestore triggers: `registerUserOnCreate` → `POST /registerUser`, `updatePolicyOnResult` → `POST /updatePolicy`. |
 | `package.json` | Node 24, firebase-functions v7, firebase-admin v13. |
+| `app-rules-snapshot.txt` | A byte-exact, **read-only** copy of the app team's live Firestore rules (ruleset `6700114d`). Never deploy it — the app team owns the rules. `tests/test_space.py` checks `space.py`'s mirror against it; `inspect_db.py` CHECK 0 diffs it against the live rules. Refresh with the Firebase Rules REST API (`releases` → `rulesets/<id>`). |
 | `firestore.indexes.json` | **All four** live composite indexes — one the optimizer needs (`interventionResults` `pid`+`phaseStep`) and three the app needs, including `parameterValues(pid, schemaVersion, createdAt DESC)` for its listener. The deploy is declarative: anything missing from this file is **deleted** from the database. |
 
 ## Wiring it up
