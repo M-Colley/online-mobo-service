@@ -4,7 +4,7 @@ gunicorn==26.0.0
 # torch: installed from the CPU-only wheel index in the Dockerfile; pinned here
 # too for reproducibility parity (the 2.13.0+cpu wheel satisfies ==2.13.0). A
 # plain `pip install -r` without the CPU index pulls the default 2.13.0 build.
-torch==2.13.0
+torch==2.14.0
 gpytorch==1.15.2
 botorch==0.18.1
 scipy==1.18.0
