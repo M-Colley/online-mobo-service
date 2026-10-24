@@ -1,4 +1,10 @@
 # Dev-only files — kept out of the Cloud Run container image
+.git/
+.env
+.venv/
+venv/
+node_modules/
+AGENTS.md
 README.md
 LICENSE
 CITATION.cff

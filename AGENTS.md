@@ -55,7 +55,7 @@ Sobol (`2·(D+1)` draws), rounds 12–17 are GP `qLogNEHVI`.
    the GP takes over on usable observations, so every discarded round shortens
    the model phase by one (logged as `has N rounds but only M usable observations`).
 4. **Never deploy `firestore:rules`.** The app team owns the live security rules
-   (last verified ruleset `6700114d`, released 2026-09-17; byte-exact copy in
+   (historical ruleset `6700114d`, released 2026-09-17; byte-exact copy in
    `firebase/app-rules-snapshot.txt` — a historical snapshot, never deployed); a blind
    deploy overwrites them.
    Note this protection is **procedural, not structural**: there is no
@@ -64,7 +64,8 @@ Sobol (`2·(D+1)` draws), rounds 12–17 are GP `qLogNEHVI`.
    running anything. Reading the rules is fine and necessary; `space.py` mirrors
    them in `rules_valid_burst()`. Current offline tests use
    `firebase/app-rules-local.txt`, copied from the app's current source with its
-   17-round cap; this has not been verified against the live database.
+   17-round cap. On 2026-10-24 it matched live ruleset
+   `e3cd8bf2-3d0f-4b66-bb46-bfb2933daca0` (released 2026-10-21).
 5. **`firebase deploy --only firestore:indexes` is declarative.** Any composite
    index on the database that is *not* in `firestore.indexes.json` gets
    **deleted** — including ones the app team created by hand. List the live

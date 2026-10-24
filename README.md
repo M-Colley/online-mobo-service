@@ -28,7 +28,7 @@ in the command above guarantees the current name for fresh checkouts.
 See the optimizer converge on a simulated participant in two commands:
 
 ```bash
-pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
 python simulate.py     # full 17-round loop: anchor → Sobol → MOBO, HV rising
 ```
@@ -123,7 +123,7 @@ created by an admin, not by the app.
 | `inspect_db.py` | Read-only Firestore inspector — document shape, observed ranges, every burst against the rules mirror, and the app's own listener query. **Run it first** whenever the app team says the parameters changed. |
 | `firebase/` | Reference copies of the Cloud Functions glue + Firestore indexes (see its README). |
 | `Makefile` / `tasks.ps1` | Task runners for the common validate/deploy commands (Linux / Windows). |
-| `requirements.txt` / `Dockerfile` | Pinned deps (incl. `torch==2.13.0`); CPU-only torch; JIT-compiles the fast EHVI kernel. |
+| `requirements.txt` / `Dockerfile` | Pinned deps (incl. `torch==2.14.1`); CPU-only torch; JIT-compiles the fast EHVI kernel. |
 | `.github/workflows/ci.yml` | CI: compile + the three test scripts on every push/PR. |
 | `analysis/` | R evaluation of the study data: `export_firestore.py` (Firestore → two tidy CSVs — one row per round, one row per round×cue) and `evaluate_mobo.R` (hypervolume, Pareto fronts, IGD+, APA reporting via `colleyRstats` + `moocore`). |
 | `AGENTS.md` | Short orientation for AI coding agents: ground rules, the deploy model, and the traps. |
@@ -405,6 +405,7 @@ firebase-deploy/
 └── functions/
     ├── index.js             ← copy from firebase/
     ├── package.json         ← copy from firebase/
+    ├── package-lock.json    ← copy from firebase/ (npm ci)
     └── .env                 ← one line:  CLOUD_RUN_URL=<service-url from step 1>
 ```
 
@@ -422,7 +423,7 @@ Install the functions' dependencies once — `firebase-tools` loads the code
 locally to discover the triggers, so deploy fails without them:
 
 ```bash
-cd firebase-deploy/functions && npm install && cd ..
+cd firebase-deploy/functions && npm ci && cd ..
 ```
 
 That discovery step has a 10 s budget and misses it on cold or Windows machines,
@@ -583,8 +584,8 @@ attention checks since 2026-09-17; a legacy result explicitly marked
 
 The source contract is the current app team's `firestore.rules`, copied into
 [`firebase/app-rules-local.txt`](firebase/app-rules-local.txt) for offline checks.
-It now caps results at 17 rounds. This local copy has **not** been verified
-against the deployed database. The historical ruleset `6700114d` (2026-09-17)
+It now caps results at 17 rounds. On 2026-10-24 this copy matched the deployed
+ruleset `e3cd8bf2-3d0f-4b66-bb46-bfb2933daca0` (released 2026-10-21). The historical ruleset `6700114d` (2026-09-17)
 remains unchanged in [`firebase/app-rules-snapshot.txt`](firebase/app-rules-snapshot.txt);
 `inspect_db.py` CHECK 0 compares live rules to that historical copy when cloud
 access is configured. The rules validate the app's own writes, so a design
@@ -639,8 +640,8 @@ automatic route-description timeout or route-recall score. The 90-second score
 floor is not a protocol timeout.
 
 Start new participants only after the app and service changes are deployed
-together. The current live rules and end-to-end cloud path remain to be checked
-when Google CLI access is configured.
+together. Use a fresh test participant for the end-to-end cloud checks before
+collecting study data with a new deployment.
 
 ### The burst profile (per cue)
 

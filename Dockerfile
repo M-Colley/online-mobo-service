@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install CPU-only PyTorch first (~200 MB vs ~2 GB for CUDA)
 RUN pip install --no-cache-dir \
-    torch==2.13.0 \
+    torch==2.14.1 \
     --index-url https://download.pytorch.org/whl/cpu
 
 # Install BoTorch and remaining ML deps (after torch so they link correctly)
