@@ -19,7 +19,7 @@ and asserts the things that would otherwise stall a real participant SILENTLY:
     (the app's rules pin the result doc's phase to that string),
   • every proposal's haptics map passes the rules mirror, with pulseCount a real
     int and exactly 5 keys x 14 cues,
-  • no proposal exceeds roundNumber 18,
+  • no proposal exceeds roundNumber 17,
   • round 1 is the anchor (the app team's seed design),
   • steps are contiguous, duplicate deliveries are suppressed, and a round whose
     result is unusable is excluded from training but still consumes its round
@@ -185,6 +185,15 @@ def _result_doc(uid: str, proposal: dict, step: int, subj: float, obj: float,
     since ruleset 6700114d; True/False build a LEGACY doc for the tolerance tests.
     """
     rid = f"{uid}_r{step}" if attention is not False else f"{uid}_r{step}_failed"
+    # Questionnaire-v2 scores lie on a 1/80 lattice. Generate real raw responses
+    # rather than teaching the service to accept inconsistent test fixtures.
+    total = round(subj * 80)
+    ease = min(total, 20)
+    ease -= (ease - total) % 5 if total > 20 else 0
+    ratings = (total - ease) // 5
+    clear = min(ratings, 4)
+    liking = min(ratings - clear, 4)
+    comfort = ratings - clear - liking
     doc = {
         "authUid": f"auth_{uid}",
         "pid": uid,
@@ -199,7 +208,12 @@ def _result_doc(uid: str, proposal: dict, step: int, subj: float, obj: float,
         "phase": "exploration",
         "phaseStep": step,
         "roundNumber": step,
-        "subjectiveScore": subj,
+        "questionnaireVersion": 2,
+        "q_cognitive_load": 21 - ease,
+        "q_clear": clear + 1,
+        "q_likability": liking + 1,
+        "q_comfort": comfort + 1,
+        "subjectiveScore": total / 80,
         "objectiveScore": obj,
         "touchedTarget": True,
         "haptics": {c: dict(b) for c, b in proposal["haptics"].items()},
@@ -227,7 +241,8 @@ def run() -> None:
     r = client.get("/health").get_json()
     assert r["ok"] and r["space"] == space.PARAM_NAMES
     assert r["schemaVersion"] == 2 and r["cues"] == 14
-    assert r["N_TOTAL"] == space.MAX_ROUND_NUMBER == 18
+    assert r["N_TOTAL"] == space.MAX_ROUND_NUMBER == 17
+    assert r["questionnaireVersion"] == space.QUESTIONNAIRE_VERSION == 2
 
     # a missing userId is a client error, not a write against a default pid
     assert client.post("/updatePolicy", json={"type": "interventionResult"}).status_code == 400
@@ -304,7 +319,7 @@ def run() -> None:
 
     # the last proposal must have told the app it was the last one
     final = fake.collection("parameterValues")._store[f"{uid}_step_{main.N_TOTAL}"]
-    assert final["isFinalRound"] is True, "the app cannot read users/ — it needs this flag"
+    assert final["isFinalRound"] is True, "retain the final-round flag for compatible consumers"
 
     # never propose past the rules' cap
     assert f"{uid}_step_{main.N_TOTAL + 1}" not in fake.collection("parameterValues")._store
@@ -375,7 +390,7 @@ def run_unusable_results_never_pin_the_design() -> None:
 
     If every echo comes back off the knob grid (the app clamps or substitutes
     something), NO result is usable, so a design chosen by usable-observation count
-    would be re-issued for all 17 remaining rounds — the participant feels one
+    would be re-issued for all 16 remaining rounds — the participant feels one
     stimulus for the entire study and the only trace is a per-round log line.
     """
     fake = FakeFirestore()
@@ -555,6 +570,65 @@ def run_exporter_matches_the_optimizer() -> None:
     print("PASS: the exporter admits exactly what the optimizer trains on.")
 
 
+def run_invalid_requests_are_client_errors() -> None:
+    main.db = FakeFirestore()
+    client = main.app.test_client()
+    for endpoint in ("/registerUser", "/updatePolicy"):
+        for payload in (None, [], [1], "pid", {}, {"userId": []}, {"userId": 101},
+                        {"userId": True}, {"userId": " "}, {"userId": "a/b"}):
+            response = client.post(endpoint, json=payload)
+            assert response.status_code == 400, (endpoint, payload, response.status_code)
+    print("PASS: malformed HTTP bodies and participant IDs return 400.")
+
+
+def run_invalid_scores_and_legacy_questionnaires_do_not_train() -> None:
+    """Bad scores still consume their round without poisoning GP/HV inputs."""
+    mutations = [
+        {"objectiveScore": float("nan")}, {"objectiveScore": float("inf")},
+        {"objectiveScore": True}, {"objectiveScore": "0.5"}, {"objectiveScore": -1},
+        {"subjectiveScore": 2}, {"questionnaireVersion": None},
+        {"questionnaireVersion": 1}, {"q_cognitive_load": 0}, {"q_clear": 6},
+        {"q_likability": True}, {"q_comfort": 2.0}, {"subjectiveScore": 0.9},
+    ]
+    for i, mutation in enumerate(mutations):
+        fake = FakeFirestore()
+        main.db = fake
+        uid = f"bad_score_{i}"
+        client = main.app.test_client()
+        assert client.post("/registerUser", json={"userId": uid}).status_code == 200
+        proposal = fake.collection("parameterValues")._store[f"{uid}_step_1"]
+        result = {**_result_doc(uid, proposal, 1, 0.5, 0.5), **mutation}
+        fake.collection("interventionResults").document(f"{uid}_r1").create(result)
+        response = client.post("/updatePolicy", json={"userId": uid, "type": "interventionResult"})
+        body = response.get_json()
+        assert response.status_code == 200 and body["obsCount"] == 0, (mutation, body)
+        assert body["roundsDone"] == 1 and body["nextPhaseStep"] == 2, body
+    print("PASS: malformed/current-mismatched and legacy questionnaires never train the current model.")
+
+
+def run_foreign_proposals_do_not_suppress_current_study() -> None:
+    fake = FakeFirestore()
+    main.db = fake
+    client = main.app.test_client()
+    uid = "old_proposal_user"
+    fake.collection("parameterValues").document("old_auto_id").create({
+        "pid": uid, "schemaVersion": 1, "phaseStep": 1})
+    body = client.post("/registerUser", json={"userId": uid}).get_json()
+    assert body.get("written"), body
+    proposals = main.Proposals(uid)
+    assert "old_auto_id" not in proposals.by_id
+    uid = "old_deterministic_user"
+    legacy = {"pid": uid, "schemaVersion": 1, "phaseStep": 1}
+    fake.collection("parameterValues").document(f"{uid}_step_1").create(legacy)
+    body = client.post("/registerUser", json={"userId": uid}).get_json()
+    assert body.get("written"), body
+    assert fake.collection("parameterValues")._store[f"{uid}_step_1"] == legacy
+    current = fake.collection("parameterValues")._store[f"{uid}_step_1_schema2"]
+    _assert_proposal_is_sane(current, 1, "legacy deterministic ID fallback")
+    assert client.post("/registerUser", json={"userId": uid}).get_json().get("skipped")
+    print("PASS: proposals hidden from the app's schema-v2 listener cannot block enrollment.")
+
+
 if __name__ == "__main__":
     run()
     run_discarded_round_keeps_the_counter()
@@ -564,3 +638,6 @@ if __name__ == "__main__":
     run_seeded_round_one_is_in_the_novelty_set()
     run_integral_float_phase_step_counts_as_a_round()
     run_exporter_matches_the_optimizer()
+    run_invalid_requests_are_client_errors()
+    run_invalid_scores_and_legacy_questionnaires_do_not_train()
+    run_foreign_proposals_do_not_suppress_current_study()

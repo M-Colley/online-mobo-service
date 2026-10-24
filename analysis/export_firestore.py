@@ -38,16 +38,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from google.cloud import firestore  # noqa: E402
-
 import space  # noqa: E402
+from study_contract import (  # noqa: E402
+    QUESTIONNAIRE_VERSION,
+    validate_questionnaire,
+    validate_scores,
+)
 
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
-if not PROJECT_ID:
-    raise SystemExit(
-        "Set GOOGLE_CLOUD_PROJECT, e.g.\n"
-        "  GOOGLE_CLOUD_PROJECT=project-multinav python analysis/export_firestore.py"
-    )
 DATABASE = os.environ.get("FIRESTORE_DATABASE", "(default)")
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.environ.get("OUT_CSV", os.path.join(HERE, "trials.csv"))
@@ -61,34 +59,57 @@ EXCLUDE_PREFIXES = ("claude_", "test_", "debug_", "sim_", "discard_")
 # is the one the analysis must split on.
 COLUMNS = (["pid", "phaseStep", "roundNumber", "phase", "optimizerPhase",
             "attentionCheckPassed", "touchedTarget", "mapName", "sessionId",
-            "candidateId", "parameterDocumentId", "spaceVersion"]
+            "resultId", "candidateId", "parameterDocumentId", "schemaVersion",
+            "spaceVersion", "questionnaireVersion", "trainingEligible",
+            "trainingExclusionReason", "q_cognitive_load", "q_clear",
+            "q_likability", "q_comfort", "q_pleasant", "q_distinct",
+            "timeToTargetSeconds"]
            + space.KNOB_NAMES
            + space.OBJECTIVE_FIELDS
            + ["hypervolume", "createdAt"])
 
-LONG_COLUMNS = ["pid", "phaseStep", "cue"] + list(space.BURST_KEYS)
+LONG_COLUMNS = ["pid", "sessionId", "resultId", "phaseStep", "questionnaireVersion",
+                "trainingEligible", "cue"] + list(space.BURST_KEYS)
 
 
 def excluded(pid: str) -> bool:
     return not pid or pid.startswith(EXCLUDE_PREFIXES)
 
 
+def _matching_proposal(proposal, pid):
+    """Match the service's per-pid, current-schema proposal query.
+
+    Missing schema/pid remain accepted for callers supplying old in-memory
+    fixtures; Firestore snapshots are filtered strictly when loaded in main().
+    """
+    if (not isinstance(proposal, dict)
+            or proposal.get("schemaVersion", space.SCHEMA_VERSION) != space.SCHEMA_VERSION
+            or str(proposal.get("pid", pid)) != pid):
+        return None
+    return proposal
+
+
 def build_rows(results, proposals_by_id, proposals_by_step, hv_by_step):
     """(rows, long_rows, skipped, excluded) from raw result docs — no Firestore.
 
-    Admissibility mirrors main.load_observations EXACTLY, or the CSV and the
-    optimizer disagree about what the study contained:
+    Keep valid historic scores and raw questionnaires without pooling their
+    different meanings. `trainingEligible` identifies the subset admitted by
+    main.load_observations under the current questionnaire contract:
       * schemaVersion must match, else the doc is not a round of this study;
       * phaseStep must be a whole number (space.round_number), else ignored;
       * the knob vector comes from space.decode_knobs — the ECHO is authoritative
         and a proposal from another spaceVersion excludes the round;
-      * a round is claimed by the first PASSING result. A failed attention check
+      * objectives must be finite numeric values in [0, 1];
+      * questionnaires retain their recorded version (absent means legacy);
+      * a round is claimed by the first valid PASSING result in its questionnaire
+        version. Invalid current questionnaires never shadow a valid result;
+      * a failed attention check
         is still exported (evaluate_mobo.R drops it) but never claims the round,
         so it cannot shadow the passing repeat behind it whatever order Firestore
         streams them in.
     """
     rows, long_rows, skipped, excluded_n = [], [], 0, 0
-    claimed: set[tuple[str, int]] = set()
+    claimed: set[tuple[str, int, str]] = set()
     for doc_id, r in results:
         pid = r.get("pid")
         pid = str(pid) if pid is not None else None
@@ -100,34 +121,59 @@ def build_rows(results, proposals_by_id, proposals_by_step, hv_by_step):
             skipped += 1
             print(f"  skipping {doc_id}: phaseStep={r.get('phaseStep')!r} is not a round number")
             continue
+        if not 1 <= step <= space.MAX_ROUND_NUMBER:
+            skipped += 1
+            print(f"  skipping {doc_id}: phaseStep={step} is outside "
+                  f"1..{space.MAX_ROUND_NUMBER}")
+            continue
         if r.get("schemaVersion") != space.SCHEMA_VERSION:
             skipped += 1
             print(f"  skipping {pid} step={step}: schemaVersion="
                   f"{r.get('schemaVersion')!r}, not this study")
             continue
         passed = r.get("attentionCheckPassed") is not False   # absent == passed
-        if passed and (pid, step) in claimed:
+        # Questionnaire versions define different response scales, even though
+        # all subjective scores use the numeric range [0, 1]. Never let a
+        # legacy result claim the current version's round during export.
+        questionnaire_version = r.get("questionnaireVersion", "")
+        version_key = (type(questionnaire_version).__name__, repr(questionnaire_version))
+        claim_key = (pid, step, str(version_key))
+        training_eligible = passed
+        exclusion_reason = "" if passed else "failed legacy attention check"
+        try:
+            validate_questionnaire(r)
+        except ValueError as exc:
+            training_eligible = False
+            exclusion_reason = str(exc)
+        if passed and claim_key in claimed:
             skipped += 1
             print(f"  skipping {pid} step={step}: duplicate result document "
                   f"(the optimizer trains on the first passing one only)")
             continue
 
-        missing = [f for f in space.OBJECTIVE_FIELDS if f not in r]
-        if missing:
+        try:
+            scores = validate_scores(r)
+        except ValueError as exc:
             skipped += 1
-            print(f"  skipping {pid} step={step}: missing {missing}")
+            print(f"  skipping {pid} step={step}: {exc}")
             continue
 
-        proposal = (proposals_by_id.get(str(r.get("parameterDocumentId")))
-                    or proposals_by_step.get((pid, step)))
-        mobo = (proposal or {}).get("mobo") or {}
+        proposal = _matching_proposal(
+            proposals_by_id.get(str(r.get("parameterDocumentId"))), pid)
+        if proposal is None:
+            proposal = _matching_proposal(proposals_by_step.get((pid, step)), pid)
+        mobo = (proposal or {}).get("mobo")
+        mobo = mobo if isinstance(mobo, dict) else {}
         knobs, why = space.decode_knobs(r, proposal)
         if knobs is None:
             skipped += 1
             print(f"  skipping {pid} step={step}: {why}")
             continue
-        if passed:
-            claimed.add((pid, step))
+        # Historical questionnaires are still useful exports. For current
+        # version docs, a malformed questionnaire cannot hide a later valid
+        # duplicate that the optimizer actually trained on.
+        if passed and (training_eligible or questionnaire_version != QUESTIONNAIRE_VERSION):
+            claimed.add(claim_key)
 
         row = {
             "pid": pid,
@@ -139,26 +185,47 @@ def build_rows(results, proposals_by_id, proposals_by_step, hv_by_step):
             "touchedTarget": r.get("touchedTarget", ""),
             "mapName": r.get("mapName", ""),
             "sessionId": r.get("sessionId", ""),
+            "resultId": r.get("resultId", doc_id),
             "candidateId": r.get("candidateId", ""),
             "parameterDocumentId": r.get("parameterDocumentId", ""),
             "spaceVersion": mobo.get("spaceVersion", ""),
-            "hypervolume": hv_by_step.get((pid, step), ""),
+            "schemaVersion": r.get("schemaVersion", ""),
+            "questionnaireVersion": questionnaire_version,
+            "trainingEligible": training_eligible,
+            "trainingExclusionReason": exclusion_reason,
+            "timeToTargetSeconds": r.get("timeToTargetSeconds", ""),
+            # Current service metrics describe only the current instrument's
+            # training set; attaching them to legacy scores would mislabel it.
+            "hypervolume": hv_by_step.get((pid, step), "") if training_eligible else "",
             "createdAt": r.get("createdAt", ""),
         }
         row.update({k: int(round(v)) for k, v in knobs.items()})
-        row.update({f: r[f] for f in space.OBJECTIVE_FIELDS})
+        row.update(dict(zip(space.OBJECTIVE_FIELDS, scores)))
+        row.update({field: r.get(field, "") for field in (
+            "q_cognitive_load", "q_clear", "q_likability", "q_comfort",
+            "q_pleasant", "q_distinct")})
         rows.append(row)
 
         haptics = r.get("haptics")
         rendered = haptics if isinstance(haptics, dict) else space.expand(knobs)
         for cue in space.CUES:
             burst = rendered.get(cue, {})
-            long_rows.append({"pid": pid, "phaseStep": step, "cue": cue,
+            long_rows.append({"pid": pid, "sessionId": row["sessionId"],
+                              "resultId": row["resultId"], "phaseStep": step,
+                              "questionnaireVersion": questionnaire_version,
+                              "trainingEligible": training_eligible, "cue": cue,
                               **{k: burst.get(k, "") for k in space.BURST_KEYS}})
     return rows, long_rows, skipped, excluded_n
 
 
 def main() -> None:
+    if not PROJECT_ID:
+        raise SystemExit(
+            "Set GOOGLE_CLOUD_PROJECT, e.g.\n"
+            "  GOOGLE_CLOUD_PROJECT=project-multinav python analysis/export_firestore.py"
+        )
+    from google.cloud import firestore
+
     db = firestore.Client(project=PROJECT_ID, database=DATABASE)
     print(f"project: {PROJECT_ID}  database: {DATABASE}")
 
@@ -168,6 +235,8 @@ def main() -> None:
     proposals_by_step: dict[tuple[str, int], dict] = {}
     for d in db.collection("parameterValues").stream():
         r = d.to_dict()
+        if r.get("schemaVersion") != space.SCHEMA_VERSION:
+            continue
         proposals_by_id[d.id] = r
         pid, step = r.get("pid"), space.round_number(r.get("phaseStep"))
         if pid is not None and step is not None:
@@ -179,7 +248,9 @@ def main() -> None:
     for d in db.collection("moboMetrics").stream():
         r = d.to_dict()
         pid, step = r.get("pid"), space.round_number(r.get("phaseStep"))
-        if pid is not None and step is not None and r.get("hypervolume") is not None:
+        if (pid is not None and step is not None
+                and r.get("hypervolume") is not None
+                and r.get("questionnaireVersion") == QUESTIONNAIRE_VERSION):
             hv_by_step[(str(pid), step)] = r["hypervolume"]
 
     results = [(d.id, d.to_dict()) for d in db.collection("interventionResults").stream()]
@@ -214,6 +285,11 @@ def main() -> None:
     if len(versions) > 1:
         print(f"\n  WARNING: rounds span multiple spaceVersions {sorted(versions)} — the knob\n"
               "  vectors are NOT comparable across versions. Split the analysis by version.")
+    questionnaire_versions = {str(r["questionnaireVersion"] or "legacy") for r in rows}
+    print(f"\nquestionnaire cohorts: {', '.join(sorted(questionnaire_versions))}; "
+          f"{sum(r['trainingEligible'] for r in rows)} training-eligible rounds")
+    print(f"evaluate_mobo.R defaults to questionnaire version {QUESTIONNAIRE_VERSION}; "
+          "select legacy explicitly to analyse unversioned results.")
 
 
 if __name__ == "__main__":

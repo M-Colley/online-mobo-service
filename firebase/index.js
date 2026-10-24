@@ -17,9 +17,31 @@ initializeApp();
 
 const CLOUD_RUN_URL = process.env.CLOUD_RUN_URL;
 
+async function callOptimizer(endpoint, payload) {
+  if (!CLOUD_RUN_URL) {
+    // A successful acknowledgement discards the event permanently. Leave the
+    // event retryable while deployment configuration is being repaired.
+    throw new Error("CLOUD_RUN_URL missing");
+  }
+  const res = await fetch(`${CLOUD_RUN_URL.replace(/\/$/, "")}/${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(210_000),
+  });
+  const txt = await res.text();
+  console.log(`[${payload.userId}] ${endpoint} response:`, res.status, txt);
+  if (res.status === 408 || res.status === 429 || res.status >= 500) {
+    throw new Error(`${endpoint} failed with ${res.status}: ${txt}`);
+  }
+  if (!res.ok) {
+    console.error(`[${payload.userId}] ${endpoint} REFUSED (${res.status}, not retried): ${txt}`);
+  }
+}
+
 /**
  * When a new user document is created (participant registers), call /registerUser
- * so step_1 is written from the Sobol seed before the app even connects.
+ * so step_1 is written from the anchor before the app connects.
  */
 exports.registerUserOnCreate = onDocumentCreated(
   // The optimizer image is large (CPU torch), so a cold start can take well over
@@ -28,31 +50,7 @@ exports.registerUserOnCreate = onDocumentCreated(
   { document: "users/{userId}", timeoutSeconds: 300, retry: true },
   async (event) => {
     const userId = event.params.userId;
-
-    if (!CLOUD_RUN_URL) {
-      console.log("CLOUD_RUN_URL missing");
-      return;
-    }
-
-    const res = await fetch(`${CLOUD_RUN_URL}/registerUser`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ userId }),
-    });
-
-    const txt = await res.text();
-    console.log(`[${userId}] registerUser response:`, res.status, txt);
-    // 4xx = the optimizer REFUSED deterministically (e.g. a design its rules
-    // mirror rejects): retrying would only repeat the refusal, so log loudly
-    // and stop. 5xx = transient; throw so the retry actually happens — without
-    // it the participant silently never receives a round-1 design.
-    if (res.status >= 400 && res.status < 500) {
-      console.error(`[${userId}] registerUser REFUSED (${res.status}, not retried): ${txt}`);
-      return;
-    }
-    if (res.status >= 500) {
-      throw new Error(`registerUser failed with ${res.status}: ${txt}`);
-    }
+    await callOptimizer("registerUser", { userId });
   }
 );
 
@@ -64,11 +62,6 @@ exports.updatePolicyOnResult = onDocumentCreated(
   async (event) => {
     const data = event.data.data();
     const userId = data.pid;
-
-    if (!CLOUD_RUN_URL) {
-      console.log("CLOUD_RUN_URL missing");
-      return;
-    }
 
     // No attention-check short-circuit any more: the app dropped attention
     // checks (ruleset 6700114d, 2026-09-17) and never repeats a round, so EVERY
@@ -84,25 +77,6 @@ exports.updatePolicyOnResult = onDocumentCreated(
       phaseStep: data.phaseStep ?? null,
     };
 
-    const res = await fetch(`${CLOUD_RUN_URL}/updatePolicy`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    const txt = await res.text();
-    console.log("Optimizer response:", res.status, txt);
-    // 4xx = a deterministic refusal (the optimizer answers 422 for a design its
-    // rules mirror rejects). Retrying would re-run the whole GP fit for the
-    // same answer, for up to 24 h — so log it as an error and stop here.
-    if (res.status >= 400 && res.status < 500) {
-      console.error(`[${userId}] updatePolicy REFUSED (${res.status}, not retried): ${txt}`);
-      return;
-    }
-    // 5xx = transient: the optimizer never wrote the next design. Throwing is
-    // the only way the participant gets another chance at it.
-    if (res.status >= 500) {
-      throw new Error(`updatePolicy failed with ${res.status}: ${txt}`);
-    }
+    await callOptimizer("updatePolicy", payload);
   }
 );

@@ -8,18 +8,19 @@ is optimised is an edit to this file; changing the WIRE FORMAT (how a design is
 written to Firestore) also lives here, in expand() / SEED_DESIGN.
 ────────────────────────────────────────────────────────────────────────────
 
-What the app actually expects (contract, ruleset 6700114d, released 2026-09-17)
+What the app actually expects (current local source contract)
 ------------------------------------------------------------------------------
-(A byte-exact copy lives in firebase/app-rules-snapshot.txt; tests/test_space.py
-fails if the mirror below stops matching it, and inspect_db.py CHECK 0 reports
-when the LIVE rules drift from the copy.)
+(A byte-exact copy of the app repository's rules lives in
+firebase/app-rules-local.txt; tests/test_space.py checks this local contract.
+The older verified live ruleset 6700114d remains archived separately in
+firebase/app-rules-snapshot.txt. Local changes have not been deployed.)
 One candidate is NOT five flat fields. It is a nested `haptics` map of
 **14 navigation cues x 5 burst values = 70 numbers**, written on a
 `parameterValues` doc that also declares `schemaVersion: 2` and a `candidateId`.
 The app's security rules validate the echo of that map when the app writes its
 own `interventionResults` doc, with exact-key checks per burst, an `is int`
 check on `pulseCount`, the cross-constraint `pulseCount <= onDuration * 120`,
-the literal string 'exploration' for `phase`, and a hard `1 <= roundNumber <= 18`.
+the literal string 'exploration' for `phase`, and a hard `1 <= roundNumber <= 17`.
 A design that violates any of those is accepted from us (the Admin SDK bypasses
 the rules) but makes the APP's write illegal — the participant then stalls with
 no error visible on our side. rules_valid_haptics() below is a literal mirror of
@@ -36,10 +37,10 @@ Burst semantics (confirmed by the app team, 2026-09-11):
 
 Why the optimizer does not search those 70 numbers
 --------------------------------------------------
-The rules cap a participant at 18 rounds and one round yields ONE
+The app caps a participant at 17 rounds and one round yields ONE
 (subjectiveScore, objectiveScore) pair for the whole session. 70 unknowns from
-18 aggregate observations is under-determined, not merely sample-starved: a GP
-over 70 inputs fits 70 lengthscales from 18 points, so the posterior is the
+17 aggregate observations is under-determined, not merely sample-starved: a GP
+over 70 inputs fits 70 lengthscales from 17 points, so the posterior is the
 prior and qLogNEHVI degenerates to quasi-random search.
 
 So we optimise **four integer JND offsets from the app team's own seed design**
@@ -108,12 +109,13 @@ import numpy as np
 
 # ── Objective (Y) field names — read from interventionResults, both maximised ──
 OBJECTIVE_FIELDS = ["subjectiveScore", "objectiveScore"]
+QUESTIONNAIRE_VERSION = 2          # independent of the haptics schema version
 
 # ── Wire-format constants (the app's contract — do not change unilaterally) ──
 SCHEMA_VERSION = 2                 # rules: interventionResults.schemaVersion == 2
 HAPTIC_MODE = "burst"              # rules: interventionResults.hapticMode == 'burst'
 WIRE_PHASE = "exploration"         # rules PIN the result doc's phase to this literal
-MAX_ROUND_NUMBER = 18              # rules: 1 <= roundNumber <= 18
+MAX_ROUND_NUMBER = 17              # current app + local rules: 1 <= roundNumber <= 17
 SPACE_VERSION = "v3-knobs-2026-09"  # stamped on every proposal; refuse to mix versions
 
 # The 14 navigation cues, exactly the key set validHaptics() requires.
@@ -251,7 +253,7 @@ CONT_PARAMS: list[ContinuousParam] = [
     # Pardo et al. 2022, median 20 % [IQR 7 %]). So one step here is only ~0.67 of
     # a real JND and the whole 9-level range spans ~5.4 discriminable steps, not 8:
     # the optimizer can spend rounds separating stimuli the participant cannot
-    # tell apart, which is expensive in an 18-round budget. Kept conservative
+    # tell apart, which is expensive in a 17-round budget. Kept conservative
     # (finer, never coarser, than the truth) until the pilot measures it on THIS
     # device and body site; widening the step to ~1.20 would buy ~3 more usable
     # levels.  # TODO confirm in the pilot
@@ -406,11 +408,11 @@ def _inverse_table() -> dict:
 
 def _design_key(haptics: dict) -> tuple:
     return tuple(
-        (cue, round(float(haptics[cue]["intensity"]), 3),
-         round(float(haptics[cue]["sharpness"]), 3),
+        (cue, float(haptics[cue]["intensity"]),
+         float(haptics[cue]["sharpness"]),
          int(haptics[cue]["pulseCount"]),
-         round(float(haptics[cue]["onDuration"]), 3),
-         round(float(haptics[cue]["offDuration"]), 3))
+         float(haptics[cue]["onDuration"]),
+         float(haptics[cue]["offDuration"]))
         for cue in CUES
     )
 
@@ -429,10 +431,13 @@ def knobs_from_haptics(haptics: dict) -> dict | None:
     this is an exact lookup. Used to train on what the app ECHOED rather than on
     what we proposed, whenever the two differ.
     """
-    try:
-        key = _design_key(haptics)
-    except (KeyError, TypeError, ValueError):
+    # expand() already rounds the values it writes. Rounding an arbitrary echo
+    # AGAIN here would map a different delivered design onto a grid point (and
+    # int() would silently truncate a non-integer pulse count). Firestore keeps
+    # the written doubles exactly, so only a valid, exact design may train a GP.
+    if not rules_valid_haptics(haptics):
         return None
+    key = _design_key(haptics)
     hit = _inverse_table().get(key)
     return dict(hit) if hit is not None else None
 
@@ -461,6 +466,8 @@ def knobs_from_stored(stored) -> dict | None:
     """A `mobo.knobs` map -> on-grid float knob dict, or None."""
     if not isinstance(stored, dict) or not all(k in stored for k in KNOB_NAMES):
         return None
+    if any(isinstance(stored[k], bool) for k in KNOB_NAMES):
+        return None
     try:
         knobs = {k: float(stored[k]) for k in KNOB_NAMES}
     except (TypeError, ValueError):
@@ -483,12 +490,16 @@ def decode_knobs(doc: dict, proposal: dict | None = None) -> tuple[dict | None, 
     refused outright — the same integers denote a different stimulus there.
     """
     source = proposal if proposal is not None else doc
-    mobo = (source.get("mobo") or {}) if isinstance(source, dict) else {}
+    mobo = source.get("mobo") if isinstance(source, dict) else None
+    if mobo is None:
+        mobo = {}
+    if not isinstance(mobo, dict):
+        return None, "mobo metadata is not a map"
     version = mobo.get("spaceVersion")
-    if version and version != SPACE_VERSION:
+    if version is not None and version != SPACE_VERSION:
         return None, f"proposed under spaceVersion={version!r}, not {SPACE_VERSION!r}"
     echo = doc.get("haptics") if isinstance(doc, dict) else None
-    if isinstance(echo, dict):
+    if isinstance(doc, dict) and "haptics" in doc:
         knobs = knobs_from_haptics(echo)
         if knobs is None:
             return None, "haptics map is off the knob grid (clamped or substituted)"
@@ -599,6 +610,8 @@ def on_grid(raw: dict) -> bool:
     """
     for p in CONT_PARAMS:
         if p.name not in raw:
+            return False
+        if isinstance(raw[p.name], bool):
             return False
         try:
             v = float(raw[p.name])

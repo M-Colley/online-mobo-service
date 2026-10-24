@@ -6,7 +6,7 @@ Run this to sanity-check the optimizer before deploying:
     python simulate.py
 
 It drives the exact code path Cloud Run uses (space + optimizer_core) for a
-full 18-round run against a synthetic "participant" whose ratings peak at a
+full 17-round run against a synthetic "participant" whose ratings peak at a
 hidden favourite knob setting, and asserts:
 
   • every proposed knob vector lies on the JND grid,
@@ -30,7 +30,7 @@ np.random.seed(0)
 
 N_ANCHOR = space.N_ANCHOR
 N_SOBOL = space.N_SOBOL_DEFAULT          # anchor + 2*(D+1) Sobol draws
-N_TOTAL = space.MAX_ROUND_NUMBER         # the app's rules cap rounds at 18
+N_TOTAL = space.MAX_ROUND_NUMBER         # the current app caps rounds at 17
 
 
 # ── A synthetic participant: two objectives, both maximised in [0,1] ──────────

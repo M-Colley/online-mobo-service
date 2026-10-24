@@ -2,7 +2,10 @@
 # =============================================================================
 # Evaluation of the per-participant MOBO runs.
 #
-#   Rscript analysis/evaluate_mobo.R [path/to/trials.csv]
+#   Rscript analysis/evaluate_mobo.R [path/to/trials.csv] [2|legacy]
+#
+# Default: questionnaire version 2 only. Select `legacy` explicitly for
+# unversioned 1--7 questionnaires; scores from the two instruments never pool.
 #
 # Input: the CSV produced by analysis/export_firestore.py — one row per
 # completed round, with the four optimized KNOBS (integer JND offsets from the
@@ -43,6 +46,7 @@ REF_POINT  <- c(-0.1, -0.1)
 # seed design, an unmodified within-participant control) and rounds 2..N_SOBOL
 # are Sobol draws. N_SOBOL = 1 + 2*(D+1) with D = 4.
 N_SOBOL    <- 11
+QUESTIONNAIRE_VERSION <- 2
 PARAMS     <- c("gainIntensity", "gainSharpness", "gainRate", "gainBurstLength")
 
 # WARNING: the app's security rules pin the RESULT doc's `phase` to the literal
@@ -52,7 +56,12 @@ PARAMS     <- c("gainIntensity", "gainSharpness", "gainRate", "gainBurstLength")
 
 args    <- commandArgs(trailingOnly = TRUE)
 csv_in  <- if (length(args) >= 1) args[1] else file.path("analysis", "trials.csv")
-out_dir <- file.path("analysis", "output")
+cohort  <- if (length(args) >= 2) args[2] else as.character(QUESTIONNAIRE_VERSION)
+if (!cohort %in% c(as.character(QUESTIONNAIRE_VERSION), "legacy")) {
+  stop("questionnaire selection must be ", QUESTIONNAIRE_VERSION, " or legacy")
+}
+out_dir <- file.path("analysis", "output",
+                     if (cohort == "legacy") "questionnaire-legacy" else paste0("questionnaire-v", cohort))
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 colleyRstats_setup(set_theme = TRUE, print_citation = FALSE, verbose = FALSE)
@@ -61,12 +70,15 @@ cat("\n=============================================================\n")
 cat("MOBO evaluation\n")
 cat("=============================================================\n")
 cat("input      :", csv_in, "\n")
+cat("questionnaire:", cohort, "(other versions excluded)\n")
 cat("objectives :", paste(OBJECTIVES, collapse = ", "), "(both maximised)\n")
 cat("reference  :", paste(REF_POINT, collapse = ", "), "\n\n")
 
 # ── 1. Load, validate, clean ─────────────────────────────────────────────────
 stopifnot(file.exists(csv_in))
-raw <- read.csv(csv_in, stringsAsFactors = FALSE)
+# Character import preserves participant IDs such as "001" and gives us control
+# over missing values and numeric validation rather than silently coercing them.
+raw <- read.csv(csv_in, stringsAsFactors = FALSE, colClasses = "character")
 
 needed <- c("pid", "phaseStep", "phase", OBJECTIVES)
 missing_cols <- setdiff(needed, names(raw))
@@ -77,12 +89,37 @@ if (length(missing_cols)) {
 trials <- raw |>
   mutate(
     pid       = as.character(pid),
-    phaseStep = as.integer(phaseStep),
-    across(all_of(intersect(OBJECTIVES, names(raw))), as.numeric),
+    phaseStep = suppressWarnings(as.numeric(phaseStep)),
+    across(all_of(OBJECTIVES), ~ suppressWarnings(as.numeric(.x))),
+    across(all_of(intersect(PARAMS, names(raw))), ~ suppressWarnings(as.numeric(.x))),
+    questionnaireVersion = if ("questionnaireVersion" %in% names(raw)) {
+      trimws(as.character(questionnaireVersion))
+    } else NA_character_,
     attentionCheckPassed = if ("attentionCheckPassed" %in% names(raw)) {
       !tolower(as.character(attentionCheckPassed)) %in% c("false", "0", "no")
     } else TRUE
   )
+
+in_cohort <- if (cohort == "legacy") {
+  is.na(trials$questionnaireVersion) | trials$questionnaireVersion == ""
+} else {
+  !is.na(trials$questionnaireVersion) & trials$questionnaireVersion == cohort
+}
+cat("excluded", sum(!in_cohort), "round(s) from other questionnaire versions\n")
+trials <- trials[in_cohort, , drop = FALSE]
+
+# The current instrument requires its exact raw fields and score formula. The
+# exporter applies the same validator as the service and records this decision.
+# A pre-update CSV lacks that decision, so require a fresh export for v2.
+if (cohort != "legacy") {
+  if (!"trainingEligible" %in% names(trials)) {
+    stop("current questionnaire analysis requires trainingEligible; re-export the data")
+  }
+  eligible <- !is.na(trials$trainingEligible) &
+    tolower(trials$trainingEligible) %in% c("true", "1", "yes")
+  cat("excluded", sum(!eligible), "round(s) ineligible under the current contract\n")
+  trials <- trials[eligible, , drop = FALSE]
+}
 
 n_failed <- sum(!trials$attentionCheckPassed)
 trials <- trials |> filter(attentionCheckPassed)
@@ -91,15 +128,23 @@ if (n_failed > 0) {
       "(the service excludes them from training too)\n")
 }
 
-out_of_range <- trials |> filter(if_any(all_of(OBJECTIVES), ~ .x < 0 | .x > 1))
-if (nrow(out_of_range)) {
-  warning("objective scores outside [0, 1] in ", nrow(out_of_range),
-          " row(s) — the reference point assumes [0, 1].")
+if (!nrow(trials)) {
+  stop("no usable rounds for questionnaire ", cohort, "; select another cohort or collect/export data")
+}
+invalid <- trials |>
+  filter(if_any(all_of(OBJECTIVES), ~ !is.finite(.x) | .x < 0 | .x > 1) |
+           !is.finite(phaseStep) | phaseStep < 1 | phaseStep != floor(phaseStep))
+if (nrow(invalid)) {
+  stop("invalid round numbers or non-finite/out-of-range scores in ", nrow(invalid),
+       " row(s); repair or re-export the data before analysis")
+}
+if (anyDuplicated(trials[c("pid", "phaseStep")])) {
+  stop("duplicate participant/round pairs within this questionnaire cohort; re-export the data")
 }
 
 # `plot_mobo2()` matches the phase column case-insensitively against exactly
 # "sampling" and "optimization" and errors if either is absent. The service
-# writes "exploration" / "exploration-fallback" / "optimization", so remap.
+# writes anchor / sobol / sobol-fallback / mobo in optimizerPhase, so remap.
 # Trials with no phase label (missing parameterValues doc) fall back to the
 # N_SOBOL cutoff.
 trials <- trials |>
@@ -157,7 +202,7 @@ if (nrow(non_mono)) {
 }
 
 # ── 3. Cross-check against the hypervolume the SERVICE wrote back ────────────
-if ("hypervolume" %in% names(trials)) {
+if (cohort != "legacy" && "hypervolume" %in% names(trials)) {
   chk <- trials |>
     mutate(hv_service = suppressWarnings(as.numeric(hypervolume))) |>
     filter(!is.na(hv_service)) |>
@@ -173,6 +218,10 @@ if ("hypervolume" %in% names(trials)) {
     }
   }
   cat("\n")
+}
+if (cohort == "legacy") {
+  cat("Legacy cohort: service hypervolume cross-check skipped because current\n",
+      "training excludes unversioned questionnaires.\n\n")
 }
 
 # The exploration/optimization boundary is a ROUND, not a label: a late

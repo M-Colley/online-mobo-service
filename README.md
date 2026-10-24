@@ -1,4 +1,4 @@
-# MOBO optimizer service
+# online-mobo-service
 
 A small, self-contained **multi-objective Bayesian optimization (MOBO)** service
 that personalizes stimulus parameters per participant during a study. Built for
@@ -12,12 +12,25 @@ two settings a participant couldn't tell apart.
 
 ## Quick start (no cloud needed)
 
+Clone the canonical repository:
+
+```bash
+git clone https://github.com/M-Colley/online-mobo-service.git online-mobo-service
+cd online-mobo-service
+```
+
+The repository and its canonical clone URL are named `online-mobo-service`.
+Older metadata used `jnd-mobo-service`. A local checkout can still have that
+name if its destination was selected explicitly or it was renamed locally;
+Git does not synchronize folder names with the remote. The explicit destination
+in the command above guarantees the current name for fresh checkouts.
+
 See the optimizer converge on a simulated participant in two commands:
 
 ```bash
 pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
-python simulate.py     # full 18-round loop: anchor → Sobol → MOBO, HV rising
+python simulate.py     # full 17-round loop: anchor → Sobol → MOBO, HV rising
 ```
 
 ---
@@ -41,7 +54,7 @@ python simulate.py     # full 18-round loop: anchor → Sobol → MOBO, HV risin
 
 ## What it does
 
-Each participant runs a fixed number of **rounds** (18 for the current study —
+Each participant runs a fixed number of **rounds** (17 for the current study —
 the app's security rules cap `roundNumber` there). For every round the service
 picks the next configuration to test:
 
@@ -60,7 +73,7 @@ closer than one just-noticeable difference.
 
 > **What a "configuration" is here.** For the VAM/multinav study a candidate is a
 > whole haptic *design*: 14 navigation cues × 5 burst values = 70 numbers. With
-> at most 18 session-level score pairs those 70 numbers are unidentifiable, so
+> at most 17 session-level score pairs those 70 numbers are unidentifiable, so
 > the optimizer searches **4 integer JND knobs** that scale the expert baseline
 > and expand deterministically to all 70. See
 > [Data contract with the app](#data-contract-with-the-app).
@@ -103,8 +116,9 @@ created by an admin, not by the app.
 | **`space.py`** | **The one file you edit to adapt the study.** Parameters, JND grids, encoding, hard-constraint hook, fail-fast validation. Torch-free. |
 | `optimizer_core.py` | Pure GP + `qLogNEHVI` candidate selection. No Firestore — unit-testable. |
 | `main.py` | Flask service: Firestore I/O, idempotency, hypervolume logging, HTTP endpoints. |
+| `study_contract.py` | Shared score and questionnaire-version validation for the service and exporter. |
 | `simulate.py` | Offline optimizer loop against a synthetic participant (asserts on-grid, unique, HV rises). |
-| `tests/test_service.py` | Full HTTP service against an in-memory Firestore fake (register → 18 rounds → done, dedup, discarded rounds, the seeded round-1 doc, exporter/optimizer agreement). |
+| `tests/test_service.py` | Full HTTP service against an in-memory Firestore fake (register → 17 rounds → done, dedup, discarded rounds, the seeded round-1 doc, exporter/optimizer agreement). |
 | `tests/test_space.py` | Unit tests for the search-space logic (no GP fitting; ~5 s, including an exhaustive pass of every reachable design against the app's rules). |
 | `inspect_db.py` | Read-only Firestore inspector — document shape, observed ranges, every burst against the rules mirror, and the app's own listener query. **Run it first** whenever the app team says the parameters changed. |
 | `firebase/` | Reference copies of the Cloud Functions glue + Firestore indexes (see its README). |
@@ -238,7 +252,7 @@ All optional; sensible defaults built in. Set on the Cloud Run service with
 |---------|---------|---------|
 | `FIRESTORE_DATABASE` | `(default)` | Firestore database id to use |
 | `N_SOBOL` | `space.N_SOBOL_DEFAULT` = `1 + 2·(D+1)` | non-model rounds: 1 anchor + `2·(D+1)` Sobol draws. The GP takes over on *usable observations*, so `N_MOBO = N_TOTAL − N_SOBOL` is a maximum. |
-| `N_TOTAL` | `space.MAX_ROUND_NUMBER` (18) | total **rounds** before `studyCompleted`. Refuses to start above the app's rules cap. |
+| `N_TOTAL` | `space.MAX_ROUND_NUMBER` (17) | total **rounds** before `studyCompleted`. Must match the app's fixed map deck; shorter and longer budgets are rejected. |
 | `NUM_RESTARTS` | `5` | acqf optimizer restarts |
 | `RAW_SAMPLES` | `256` | acqf raw samples |
 | `MC_SAMPLES` | `64` | MC samples for the hypervolume estimate |
@@ -246,7 +260,7 @@ All optional; sensible defaults built in. Set on the Cloud Run service with
 The acqf knobs are deliberately light. With `CAT_PARAMS = []` the plain
 `optimize_acqf` path runs (one inner optimisation, not one per categorical
 combination), so a single `/updatePolicy` call stays well under the Cloud Run
-300 s timeout at `D = 4` with ≤18 observations. Re-measure if `D` grows.
+300 s timeout at `D = 4` with ≤17 observations. Re-measure if `D` grows.
 
 ## Local development & validation
 
@@ -567,11 +581,13 @@ attention checks since 2026-09-17; a legacy result explicitly marked
 
 ## Data contract with the app
 
-The authoritative contract is the app team's Firestore **security rules** (ruleset
-`6700114d`, released 2026-09-17; byte-exact copy in
-[`firebase/app-rules-snapshot.txt`](firebase/app-rules-snapshot.txt), and
-`inspect_db.py` CHECK 0 reports when the live rules drift from it). They
-validate the app's own writes, so a design
+The source contract is the current app team's `firestore.rules`, copied into
+[`firebase/app-rules-local.txt`](firebase/app-rules-local.txt) for offline checks.
+It now caps results at 17 rounds. This local copy has **not** been verified
+against the deployed database. The historical ruleset `6700114d` (2026-09-17)
+remains unchanged in [`firebase/app-rules-snapshot.txt`](firebase/app-rules-snapshot.txt);
+`inspect_db.py` CHECK 0 compares live rules to that historical copy when cloud
+access is configured. The rules validate the app's own writes, so a design
 this service writes that violates them is accepted from us (the Admin SDK bypasses
 rules) and then makes the *app's* result write illegal — which produces no error
 on our side at all. `space.rules_valid_burst()` mirrors the predicate and
@@ -586,14 +602,45 @@ on our side at all. `space.rules_valid_burst()` mirrors the predicate and
   `parameterDocumentId`, `candidateId`, `sessionId`, `mapName`, `authUid`,
   `resultId`. The app copies `phase`, `candidateId`, `schemaVersion` and
   `phaseStep` from our proposal verbatim, and echoes the design it *delivered*.
+  Current results also carry `questionnaireVersion: 2`, `q_cognitive_load`
+  (integer 1–21), and `q_clear`, `q_likability`, `q_comfort` (integers 1–5).
 - Round 1 is seeded **by the app team** (an auto-id doc per participant); the
-  service recognises it and writes rounds 2–18.
+  service recognises it and writes rounds 2–17.
 - Service writes the anytime hypervolume to `moboMetrics/{pid}_step_N` — **never**
   into the app's own doc, whose rules permit a client update only for a retry that
   changes nothing but `createdAt`.
-- Study ends at `N_TOTAL` **rounds** → `users/{pid}.studyCompleted = true`. The app
-  cannot read `users/`, so the end-of-study signal it *can* see is `isFinalRound`
-  on the last proposal.
+- Study ends at 17 **rounds** → `users/{pid}.studyCompleted = true`. The current
+  app stops after its 17-map deck; it does not consume `isFinalRound`. The service
+  still includes that field on proposals for compatible consumers.
+
+### Scores and questionnaire versions
+
+Both objectives are maximized in [0, 1]. For questionnaire version 2:
+
+```text
+subjectiveScore = ((21 - q_cognitive_load) / 20
+                 + (q_clear - 1) / 4
+                 + (q_likability - 1) / 4
+                 + (q_comfort - 1) / 4) / 4
+```
+
+The service checks raw integer answers, this formula and finite numeric scores.
+Legacy/unversioned questionnaires still consume rounds, but do not train the
+current GP. Their scores measure a different instrument. The exporter retains
+their recorded answers and marks `trainingEligible`; it never invents missing
+responses. R defaults to version 2; use `Rscript analysis/evaluate_mobo.R
+analysis/trials.csv legacy` to analyze unversioned results separately.
+
+`touchedTarget` means touching the overview's destination, not correctly
+describing the route. With a target touch, `objectiveScore` is the clipped
+`(90 - timeToTargetSeconds) / (90 - 5)`; without one, it is zero. Finishing
+exploration opens the survey even without a touch. The app implements no
+automatic route-description timeout or route-recall score. The 90-second score
+floor is not a protocol timeout.
+
+Start new participants only after the app and service changes are deployed
+together. The current live rules and end-to-end cloud path remain to be checked
+when Google CLI access is configured.
 
 ### The burst profile (per cue)
 
@@ -621,8 +668,8 @@ Python `float` lands in Firestore as a double and fails `pulseCount is int`.
 
 ### What is optimized
 
-14 × 5 = 70 numbers against at most 18 session-level score pairs is
-under-determined — a GP over 70 inputs fits 70 lengthscales from 18 points, so the
+14 × 5 = 70 numbers against at most 17 session-level score pairs is
+under-determined — a GP over 70 inputs fits 70 lengthscales from 17 points, so the
 posterior is the prior and `qLogNEHVI` degenerates into quasi-random search. The
 optimizer therefore searches four **integer JND knobs**, offsets from the app
 team's seed design (`space.SEED_DESIGN`, copied verbatim from the live doc):
@@ -639,11 +686,13 @@ contrasts the app team designed between cues survive at every knob setting —
 re-gridding absolute per-cue values does not (at low settings the 14 cues collapse
 onto one intensity and the navigation signal is destroyed). Knobs all zero
 reproduces the seed design exactly, so the expert baseline is reachable and is the
-worst case, not a lucky draw. `offDuration` is held at its seed value pending an
-answer on whether a cue loops.
+worst case, not a lucky draw. `offDuration` is held at its seed value; the current
+app restarts a burst while the finger remains on that element. Maximum-intensity
+defaults are for local practice only; remote candidates retain the expert seed
+and are played exactly as received.
 
 The whole grid is 9 × 7 × 11 × 8 = **5,544 designs**; `tests/test_space.py` checks
-exhaustively that every one of them satisfies the live rules and that the map is
+exhaustively that every one of them satisfies the local app rules and that the map is
 injective (so a rendered design can be inverted back to its knobs, which is how
 history is read back from what the app echoed).
 

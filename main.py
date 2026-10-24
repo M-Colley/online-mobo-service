@@ -5,7 +5,7 @@ Firestore-mediated, same as before:
   app -> interventionResults -> Cloud Function -> POST /updatePolicy -> here,
   here -> parameterValues -> app snapshot listener.
 
-What a document looks like now (contract, ruleset 6700114d — see space.py):
+What a document looks like now (current local app contract — see space.py):
 a candidate is a nested `haptics` map of 14 navigation cues x 5 burst values,
 carried on a doc that declares `schemaVersion: 2`, a `candidateId`, and the
 literal `phase: "exploration"`. The optimizer's own state (the knob vector and
@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 
 import torch
 from flask import Flask, request, jsonify
+from werkzeug.exceptions import BadRequest
 from google.api_core import exceptions as gapi_exceptions
 from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
@@ -38,6 +39,7 @@ from botorch.utils.multi_objective.pareto import is_non_dominated
 
 import space
 import optimizer_core as core
+from study_contract import validate_questionnaire, validate_scores
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -58,7 +60,7 @@ METRICS = "moboMetrics"   # our own bookkeeping; we never write to the app's doc
 # Defined once in space.py (N_ANCHOR, N_SOBOL_DEFAULT) so simulate.py, the tests
 # and this service cannot drift apart; overridable here via env vars. Round 1 is
 # the anchor, rounds 2..N_SOBOL are Sobol draws, the rest are GP rounds. N_TOTAL
-# is capped by the app's security rules, which reject roundNumber > 18. N_MOBO
+# is capped by the current app contract, which rejects roundNumber > 17. N_MOBO
 # is a MAXIMUM: the GP takes over only once N_SOBOL usable observations exist,
 # so every discarded round shortens the model-driven phase by one.
 N_ANCHOR = space.N_ANCHOR
@@ -66,11 +68,13 @@ N_SOBOL = int(os.environ.get("N_SOBOL", str(space.N_SOBOL_DEFAULT)))
 N_TOTAL = int(os.environ.get("N_TOTAL", str(space.MAX_ROUND_NUMBER)))
 N_MOBO = max(0, N_TOTAL - N_SOBOL)
 
-if N_TOTAL > space.MAX_ROUND_NUMBER:
+if N_SOBOL < N_ANCHOR or N_TOTAL < 1:
+    raise SystemExit("N_SOBOL must include the anchor and N_TOTAL must be positive")
+if N_TOTAL != space.MAX_ROUND_NUMBER:
     raise SystemExit(
-        f"N_TOTAL={N_TOTAL} exceeds the app's rules cap of {space.MAX_ROUND_NUMBER} "
-        "rounds — every result past the cap would be rejected by Firestore and the "
-        "participant would stall with no error visible here."
+        f"N_TOTAL={N_TOTAL} must match the app's fixed {space.MAX_ROUND_NUMBER}-round "
+        "map deck. A shorter budget leaves the app waiting; a longer budget "
+        "writes a candidate the app rejects."
     )
 if N_SOBOL >= N_TOTAL:
     raise SystemExit(
@@ -124,6 +128,7 @@ def log_hypervolume(user_id: str, Y: torch.Tensor, phase_step: int, obs_count: i
             "obsCount": obs_count,
             "hypervolume": hv,
             "spaceVersion": space.SPACE_VERSION,
+            "questionnaireVersion": space.QUESTIONNAIRE_VERSION,
             "createdAt": firestore.SERVER_TIMESTAMP,
         },
         merge=True,
@@ -156,6 +161,10 @@ class Proposals:
                      .where(filter=FieldFilter("pid", "==", user_id))
                      .stream()):
             doc = snap.to_dict() or {}
+            # Legacy proposals are invisible to the app's schema-v2 listener.
+            # They must not suppress registration or a current round's write.
+            if doc.get("schemaVersion") != space.SCHEMA_VERSION:
+                continue
             self.by_id[snap.id] = doc
             step = space.round_number(doc.get("phaseStep"))
             if step is not None:
@@ -234,8 +243,8 @@ def load_observations(user_id: str, proposals: Proposals):
         # (trained on, but not counted as a round) is what makes next_phase_step
         # point at a doc that already exists — the permanent skip.
         step = space.round_number(raw_step)
-        if step is None:
-            log.warning("load_observations: %s has phaseStep=%r, not a round number — ignored",
+        if step is None or not 1 <= step <= space.MAX_ROUND_NUMBER:
+            log.warning("load_observations: %s has phaseStep=%r, not a study round — ignored",
                         user_id, raw_step)
             continue
         # Count the round FIRST: a discarded round still consumed a roundNumber.
@@ -251,11 +260,14 @@ def load_observations(user_id: str, proposals: Proposals):
         # One malformed doc (missing scores, an unreachable design, a stale
         # spaceVersion) must not take down the whole participant's update.
         try:
+            # A new questionnaire changes what the objective means. Count older
+            # rounds without pooling their scores into the current model.
+            y_row = validate_scores(d)
+            validate_questionnaire(d)
             knobs = knobs_for_result(user_id, d, step, proposals)
             if knobs is None:
                 continue
             x_row = space.to_model_row(knobs)
-            y_row = [float(d[f]) for f in space.OBJECTIVE_FIELDS]
             key = space.obs_key(knobs)
         except (KeyError, ValueError, TypeError) as e:
             log.warning("load_observations: skipping malformed doc for %s step=%s: %s", user_id, step, e)
@@ -292,9 +304,8 @@ def build_proposal_doc(user_id: str, knobs: dict, optimizer_phase: str, phase_st
         "phase": space.WIRE_PHASE,
         "phaseStep": phase_step,
         "roundNumber": phase_step,
-        # The app cannot read users/{pid}.studyCompleted (the rules deny reads on
-        # every collection except parameterValues), so the end-of-study signal
-        # has to travel on this doc.
+        # Retained for compatible consumers. The current app stops after its
+        # fixed map deck rather than reading users/ or this flag.
         "isFinalRound": phase_step >= N_TOTAL,
         "createdAt": firestore.SERVER_TIMESTAMP,
         "haptics": haptics,
@@ -313,10 +324,10 @@ def write_next_params(user_id: str, knobs: dict, optimizer_phase: str, phase_ste
     not retried) for a design the rules would reject, and lets transient
     Firestore errors propagate (-> 500, retried by the Cloud Function).
     """
-    if phase_step > space.MAX_ROUND_NUMBER:
+    if type(phase_step) is not int or not 1 <= phase_step <= N_TOTAL:
         raise ProposalRefused(
             f"{user_id} step={phase_step}: the app's rules cap roundNumber at "
-            f"{space.MAX_ROUND_NUMBER} and would reject the result"
+            f"{min(N_TOTAL, space.MAX_ROUND_NUMBER)} and would reject the result"
         )
 
     doc = build_proposal_doc(user_id, knobs, optimizer_phase, phase_step)
@@ -330,21 +341,24 @@ def write_next_params(user_id: str, knobs: dict, optimizer_phase: str, phase_ste
             f"{user_id} step={phase_step}: rendered design violates validHaptics"
         )
 
-    ref = db.collection(PROPOSALS).document(f"{user_id}_step_{phase_step}")
-    try:
-        ref.create(doc)
-        return True
-    except gapi_exceptions.AlreadyExists:
-        # The only benign failure: a concurrent delivery got there first.
-        log.warning("write_next_params: step_%d already exists for %s — duplicate suppressed",
-                    phase_step, user_id)
-        return False
-    except Exception:
-        # Anything else (permission, quota, deadline, an outage) used to be
-        # logged as a duplicate and swallowed, which is indistinguishable from a
-        # stalled participant. Let it surface as a 5xx so the function retries.
-        log.exception("write_next_params: FAILED to write step_%d for %s", phase_step, user_id)
-        raise
+    base_id = f"{user_id}_step_{phase_step}"
+    # A schema-1 document can occupy the old deterministic ID while remaining
+    # invisible to the app. Keep it intact and use a deterministic schema-2 ID.
+    for doc_id in (base_id, f"{base_id}_schema{space.SCHEMA_VERSION}"):
+        ref = db.collection(PROPOSALS).document(doc_id)
+        try:
+            ref.create(doc)
+            return True
+        except gapi_exceptions.AlreadyExists:
+            existing = ref.get().to_dict() or {}
+            if (existing.get("schemaVersion") == space.SCHEMA_VERSION
+                    and existing.get("pid") == user_id
+                    and space.round_number(existing.get("phaseStep")) == phase_step):
+                log.warning("write_next_params: step_%d already exists for %s — duplicate suppressed",
+                            phase_step, user_id)
+                return False
+            log.warning("write_next_params: %s occupied by an incompatible proposal", doc_id)
+    raise ProposalRefused(f"{user_id} step={phase_step}: both proposal IDs are occupied by incompatible docs")
 
 
 def study_completed(user_id: str) -> bool:
@@ -355,7 +369,7 @@ def study_completed(user_id: str) -> bool:
 def already_enrolled(user_id: str) -> bool:
     """True if ANY proposal exists for this pid, whoever wrote it.
 
-    One limited query on pid alone — not by document id and not by phaseStep:
+    One limited schema-v2 query — not by document id or phaseStep:
     the app team seeds round 1 with an auto-id doc, and nothing in the
     schemaVersion-2 contract obliges a parameterValues doc to carry phaseStep,
     so a narrower check can miss it and write a competing round-1 design that
@@ -363,6 +377,7 @@ def already_enrolled(user_id: str) -> bool:
     """
     for _ in (db.collection(PROPOSALS)
               .where(filter=FieldFilter("pid", "==", user_id))
+              .where(filter=FieldFilter("schemaVersion", "==", space.SCHEMA_VERSION))
               .limit(1)
               .stream()):
         return True
@@ -399,12 +414,22 @@ def choose_proposal(obs_count: int, next_phase_step: int, avoid: set,
 
 
 # ── Registration endpoint ────────────────────────────────────────────────────
+def request_payload() -> tuple[dict, str]:
+    """Reject malformed input before using a pid as a Firestore path or lock key."""
+    payload = request.get_json(force=True)
+    if not isinstance(payload, dict):
+        raise BadRequest("request body must be a JSON object")
+    user_id = payload.get("userId")
+    if (not isinstance(user_id, str) or not user_id.strip()
+            or "/" in user_id or user_id in (".", "..")
+            or len(user_id.encode("utf-8")) > 1400):
+        raise BadRequest("userId must be a non-empty Firestore document ID")
+    return payload, user_id
+
+
 @app.post("/registerUser")
 def register_user():
-    payload = request.get_json(force=True)
-    user_id = payload.get("userId")
-    if not user_id:
-        return jsonify({"ok": False, "error": "missing userId"}), 400
+    payload, user_id = request_payload()
 
     with _user_locks[user_id]:
         # Completion writes users/{pid} with merge=True, which CREATES the doc
@@ -426,10 +451,7 @@ def register_user():
 # ── Main endpoint ────────────────────────────────────────────────────────────
 @app.post("/updatePolicy")
 def update_policy():
-    payload = request.get_json(force=True)
-    user_id = payload.get("userId")
-    if not user_id:
-        return jsonify({"ok": False, "error": "missing userId"}), 400
+    payload, user_id = request_payload()
 
     if payload.get("type") != "interventionResult":
         return jsonify({"ok": True, "ignored": True})
@@ -502,6 +524,7 @@ def health():
                     "space": space.PARAM_NAMES,
                     "spaceVersion": space.SPACE_VERSION,
                     "schemaVersion": space.SCHEMA_VERSION,
+                    "questionnaireVersion": space.QUESTIONNAIRE_VERSION,
                     "cues": len(space.CUES),
                     "database": FIRESTORE_DATABASE,
                     "N_ANCHOR": N_ANCHOR, "N_SOBOL": N_SOBOL,

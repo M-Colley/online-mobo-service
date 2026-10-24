@@ -18,7 +18,7 @@ Cloud Run  →  parameterValues/{pid}_step_N  →  app's snapshot listener
 
 A candidate is a whole **haptic design**: a nested `haptics` map of 14 navigation
 cues × 5 burst values (70 numbers), written under `schemaVersion: 2`. The app's
-security rules cap a participant at **18 rounds**, and one round yields a single
+security rules cap a participant at **17 rounds**, and one round yields a single
 pair of scores for the entire session — so 70 free numbers would be
 *unidentifiable*, not merely under-sampled.
 
@@ -26,7 +26,7 @@ The optimizer therefore searches **four integer JND knobs** (`gainIntensity`,
 `gainSharpness`, `gainRate`, `gainBurstLength`) that are offsets from the app
 team's seed design; `space.expand()` turns a knob vector into all 70 numbers.
 Knobs all zero **is** the seed design. Round 1 is that anchor, rounds 2–11 are
-Sobol (`2·(D+1)` draws), rounds 12–18 are GP `qLogNEHVI`.
+Sobol (`2·(D+1)` draws), rounds 12–17 are GP `qLogNEHVI`.
 
 ## Ground rules
 
@@ -55,14 +55,16 @@ Sobol (`2·(D+1)` draws), rounds 12–18 are GP `qLogNEHVI`.
    the GP takes over on usable observations, so every discarded round shortens
    the model phase by one (logged as `has N rounds but only M usable observations`).
 4. **Never deploy `firestore:rules`.** The app team owns the live security rules
-   (ruleset `6700114d`, released 2026-09-17; byte-exact copy in
-   `firebase/app-rules-snapshot.txt` — a snapshot, never deployed); a blind
+   (last verified ruleset `6700114d`, released 2026-09-17; byte-exact copy in
+   `firebase/app-rules-snapshot.txt` — a historical snapshot, never deployed); a blind
    deploy overwrites them.
    Note this protection is **procedural, not structural**: there is no
    `firebase.json` in this repository at all, so the deploy runs from whatever
    external `firebase-deploy/` directory you built — check *that* copy before
    running anything. Reading the rules is fine and necessary; `space.py` mirrors
-   them in `rules_valid_burst()`.
+   them in `rules_valid_burst()`. Current offline tests use
+   `firebase/app-rules-local.txt`, copied from the app's current source with its
+   17-round cap; this has not been verified against the live database.
 5. **`firebase deploy --only firestore:indexes` is declarative.** Any composite
    index on the database that is *not* in `firestore.indexes.json` gets
    **deleted** — including ones the app team created by hand. List the live
@@ -117,13 +119,22 @@ think you deployed is the one running.
 | Collection | Written by | Must contain |
 |-----------|-----------|--------------|
 | `users/{pid}` | **an admin** | clients cannot write here (rules deny it), so `registerUserOnCreate` only fires for an Admin SDK / console create |
-| `interventionResults/{id}` | app | `pid`, `phaseStep` == `roundNumber` (1–18), `touchedTarget`, `parameterDocumentId`, `candidateId`, `sessionId`, `mapName`, `authUid`, `resultId`, `schemaVersion` 2, `hapticMode` `'burst'`, `phase` `'exploration'`, both `space.OBJECTIVE_FIELDS`, and the echoed 14-cue `haptics` map |
+| `interventionResults/{id}` | app | `pid`, `phaseStep` == `roundNumber` (1–17), `touchedTarget`, `parameterDocumentId`, `candidateId`, `sessionId`, `mapName`, `authUid`, `resultId`, `schemaVersion` 2, `hapticMode` `'burst'`, `phase` `'exploration'`, both `space.OBJECTIVE_FIELDS`, and the echoed 14-cue `haptics` map |
 | `parameterValues/{pid}_step_N` | this service | `schemaVersion` 2, `candidateId`, `phase` `'exploration'`, `phaseStep`/`roundNumber`, `isFinalRound`, the `haptics` map, and a `mobo` map holding the knobs + the real phase |
 | `moboMetrics/{pid}_step_N` | this service | the anytime hypervolume. **Never annotate the app's own docs** — their rules allow a client update only for a retry that changes nothing but `createdAt`. |
 
 `users/{pid}.studyCompleted = true` is set once `N_TOTAL` **rounds** (not clean
-observations) exist. The app cannot read `users/` — it learns the study is over
-from `isFinalRound` on the last proposal.
+observations) exist. The app cannot read `users/`; its current source stops after
+the fixed 17-map deck and does not consume `isFinalRound`. The service retains
+that proposal field for compatible consumers. `N_TOTAL` must match that deck.
+
+Current source alignment (2026-10-24): questionnaire v2 uses reversed cognitive
+load 1–21 plus clarity, likability and comfort 1–5. `study_contract.py` validates
+the raw answers and normalized score before training. Legacy questionnaire
+rounds count but are excluded from the current GP; the exporter preserves their
+answers and R analyzes versions separately. `schemaVersion: 2` is independent
+of `questionnaireVersion: 2`. The remote expert seed is unchanged; the app's
+maximum-intensity defaults apply to local practice only.
 
 ## Traps
 
@@ -164,7 +175,7 @@ from `isFinalRound` on the last proposal.
   rules' `pulseCount <= onDuration * 120` encodes. Confirmed by the app team
   2026-09-11. `offDuration` is the silence before the burst repeats.
 - **Rounds are counted, not observations.** The rules pin
-  `phaseStep == roundNumber` and cap it at 18, so `load_observations()` returns
+  `phaseStep == roundNumber` and cap it at 17, so `load_observations()` returns
   `rounds_done` (max `phaseStep` seen, taken *before* any content filter)
   separately from the training-set size. Conflating them desynchronises the
   counter the moment a round is discarded, and the service then re-proposes a
@@ -182,13 +193,13 @@ Myles Thornell Timmer (WAIVE Lab, GVSU) confirmed on **2026-09-17**:
    proposal onto its result **verbatim** — hence `phase` is always `'exploration'`.
 3. Extra proposal fields (`mobo`, `isFinalRound`) are harmless: `validResult` is
    not key-exact (asserted against the snapshot in `tests/test_space.py`).
-4. The listener takes the **newest** doc for the pid with `schemaVersion == 2`;
-   the app learns the study is over from `isFinalRound` on round 18.
+4. The listener takes the **newest** doc for the pid with `schemaVersion == 2`.
+   The current source stops at the end of its 17-map deck.
 5. **No attention checks.** Dropped from `validResult` in ruleset `6700114d`; the
    app never repeats a round, so `firebase/index.js` forwards every result. A
    legacy result explicitly marked `false` is still excluded from training.
 6. The echoed `haptics` is what was **delivered** — that is what we train on.
-7. All 18 rounds happen in **one session**, and **maps vary** between rounds —
+7. All 17 rounds happen in **one session**, and **maps vary** between rounds —
    so map difficulty and route learning are nuisance factors the analysis must
    model (`mapName`, round index); the optimizer sees them as noise.
 
@@ -196,16 +207,18 @@ Burst semantics were confirmed 2026-09-11 (see Traps).
 
 ## Open questions
 
-- What do `subjectiveScore`, `objectiveScore` and `touchedTarget` measure now?
-  (asked 2026-09-17, unanswered)
+- `touchedTarget` is destination touch, not route recall. The objective is
+  clipped speed (5–90 seconds), zero without a target touch; subjective v2 is
+  the equally weighted normalized questionnaire. There is no automatic recall
+  timeout or recall metric; those need a protocol decision before implementation.
 - Could the four cues seeded at `sharpness 1.0` (`start`, `end`,
   `onRouteSidewalk`, `onRouteCrosswalk`) be seeded at ~0.85 to give the
   sharpness knob headroom? (asked, unanswered)
 - Can the questionnaire produce a per-cue rating? Not asked yet. It is the
   highest-value question left — it would turn one round into up to 14
   observations and make per-cue personalization defensible.
-- Does a cue loop until the navigation state changes? Not asked in the sent
-  email; `offDuration` is held at the seed values until it is.
+- The current app source restarts a burst while a finger remains on the element.
+  `offDuration` remains fixed at seed values; changing it is a study-space change.
 
 Two knob step sizes are placeholders with no psychophysical basis:
 `gainSharpness` (0.20 additive) and `gainBurstLength` (×1.25). The

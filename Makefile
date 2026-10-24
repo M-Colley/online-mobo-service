@@ -4,7 +4,7 @@ REGION  ?= us-central1
 PROJECT ?=
 SERVICE ?= vam-optimizer
 PY      ?= python3
-MODULES  = space.py optimizer_core.py main.py simulate.py tests/test_service.py tests/test_space.py inspect_db.py
+MODULES  = space.py optimizer_core.py study_contract.py main.py simulate.py tests/test_service.py tests/test_space.py tests/test_export.py analysis/export_firestore.py inspect_db.py
 
 .PHONY: help describe unit test inspect deploy
 
@@ -20,9 +20,12 @@ unit:               ## search-space unit tests (~5 s, exhaustive rules pass)
 
 test:               ## compile + unit + simulate + full service test
 	$(PY) -m py_compile $(MODULES)
+	$(PY) space.py
 	$(PY) tests/test_space.py
 	$(PY) simulate.py
 	$(PY) tests/test_service.py
+	$(PY) tests/test_export.py
+	node --test firebase/test_index.cjs
 
 inspect:            ## read-only Firestore inspector (needs auth + GOOGLE_CLOUD_PROJECT)
 	$(PY) inspect_db.py

@@ -6,7 +6,7 @@ edit space.py:
 
 Covers the grid builders, snapping/encoding round-trips, dedup keys, the acqf
 plumbing, Sobol/random draws, and — the important one — an EXHAUSTIVE check that
-every one of the 5,544 reachable designs satisfies the app's live security rules
+every one of the 5,544 reachable designs satisfies the app's local security rules
 and that the knob -> design map is injective. That exhaustive pass is what stops
 a bad edit here from silently stalling a participant mid-study: an illegal
 design is accepted from us (Admin SDK bypasses rules) but makes the APP's own
@@ -98,7 +98,7 @@ def test_anchor_reproduces_the_seed_design():
 
 
 def test_every_reachable_design_is_legal_and_unique():
-    """EXHAUSTIVE: all 5,544 knob settings x 14 cues against the live rules."""
+    """EXHAUSTIVE: all 5,544 knob settings x 14 cues against the local app rules."""
     seen: dict = {}
     n = 0
     for knobs in space.all_knob_settings():
@@ -135,6 +135,20 @@ def test_knobs_recover_from_a_rendered_design():
     assert space.knobs_from_haptics(tampered) is None
 
 
+def test_inverse_rejects_changed_or_malformed_delivered_haptics():
+    # The echo is what the participant felt. Earlier rounding/truncation in the
+    # inverse lookup silently treated changed doubles and pulse counts as seed.
+    for field, value in (("intensity", 0.2501), ("sharpness", 0.2501),
+                         ("onDuration", 1.0001), ("offDuration", 0.0101),
+                         ("pulseCount", 60.5), ("pulseCount", 60.0),
+                         ("pulseCount", True), ("intensity", "0.25"),
+                         ("intensity", float("nan"))):
+        changed = {c: dict(b) for c, b in space.SEED_DESIGN.items()}
+        changed["turn"][field] = value
+        assert space.knobs_from_haptics(changed) is None, (field, value)
+    assert space.knobs_from_haptics({**space.SEED_DESIGN, "unknownCue": {}}) is None
+
+
 def test_rules_mirror_rejects_what_the_app_rejects():
     good = space.SEED_DESIGN["onRoute"]
     assert space.rules_valid_burst(good)
@@ -158,14 +172,14 @@ def test_rules_mirror_rejects_what_the_app_rejects():
     assert not space.rules_valid_haptics({**space.SEED_DESIGN, "unknownCue": good})
 
 
-def test_rules_mirror_matches_the_app_teams_rules():
-    # firebase/app-rules-snapshot.txt is a byte-exact copy of the live ruleset.
-    # If the app team changes a bound and someone refreshes the snapshot, this is
+def test_rules_mirror_matches_the_app_teams_local_rules():
+    # firebase/app-rules-local.txt is a byte-exact copy of the app repo's rules,
+    # not a claim about deployed rules. If the app team changes a bound, this is
     # the test that says space.py's mirror is now wrong — BEFORE a participant
     # stalls on a design the app can no longer echo.
     import re
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "firebase", "app-rules-snapshot.txt")
+                        "firebase", "app-rules-local.txt")
     with open(path, encoding="utf-8") as fh:
         rules = fh.read()
 
@@ -270,12 +284,27 @@ def test_decode_knobs_is_the_single_source_of_truth():
     assert space.decode_knobs({"mobo": {"knobs": {**ours["mobo"]["knobs"], "gainRate": 99}}})[0] is None
 
 
+def test_decode_knobs_rejects_malformed_metadata_and_echo():
+    stored = {"knobs": space.anchor(), "spaceVersion": space.SPACE_VERSION}
+    for malformed in ([], ["knobs"], "not-a-map", 7, False):
+        knobs, why = space.decode_knobs({"haptics": space.SEED_DESIGN, "mobo": malformed})
+        assert knobs is None and "not a map" in why, (malformed, why)
+    for malformed in (None, [], "not-a-map", {}):
+        # A present malformed echo must never fall back to proposed knobs.
+        assert space.decode_knobs({"haptics": malformed, "mobo": stored})[0] is None
+    for version in ("", 0, False):
+        assert space.decode_knobs({"haptics": space.SEED_DESIGN,
+                                   "mobo": {**stored, "spaceVersion": version}})[0] is None
+    assert space.knobs_from_stored({**space.anchor(), "gainRate": True}) is None
+
+
 def test_on_grid_guard():
     assert space.on_grid(space.anchor())
     assert space.on_grid(space.sobol_next(3))
     for bad in ({**space.anchor(), "gainRate": 99.0},        # outside the range
                 {**space.anchor(), "gainRate": 0.5},         # between levels
                 {**space.anchor(), "gainRate": "x"},         # not a number
+                {**space.anchor(), "gainRate": True},        # bool is not a knob
                 {k: v for k, v in space.anchor().items() if k != "gainRate"}):  # missing
         assert not space.on_grid(bad), bad
 
@@ -315,7 +344,8 @@ def test_budget_fits_the_rules_round_cap():
     # anchor + 2*(D+1) Sobol rounds must leave room for at least one GP round.
     assert space.N_SOBOL_DEFAULT == space.N_ANCHOR + 2 * (space.D + 1)
     assert space.N_SOBOL_DEFAULT < space.MAX_ROUND_NUMBER
-    assert space.MAX_ROUND_NUMBER == 18
+    assert space.MAX_ROUND_NUMBER == 17
+    assert space.MAX_ROUND_NUMBER - space.N_SOBOL_DEFAULT == 6
 
 
 def test_validator_catches_bad_space():

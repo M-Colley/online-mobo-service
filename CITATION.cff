@@ -1,10 +1,10 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it using the metadata below."
-title: "MOBO optimizer service: JND-discretised multi-objective Bayesian optimization on Cloud Run"
+title: "online-mobo-service: JND-discretised multi-objective Bayesian optimization on Cloud Run"
 type: software
 authors:
   - family-names: Colley
     given-names: Mark
-repository-code: "https://github.com/M-Colley/jnd-mobo-service"
+repository-code: "https://github.com/M-Colley/online-mobo-service"
 license: MIT
 # A paper reference (preferred-citation) will be added here once published.
