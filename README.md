@@ -30,7 +30,7 @@ See the optimizer converge on a simulated participant in two commands:
 ```bash
 pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
-python simulate.py     # full 17-round loop: anchor → Sobol → MOBO, HV rising
+python simulate.py     # full 17-round loop: anchor → Sobol → MOBO → re-test, HV rising
 ```
 
 ---
@@ -64,9 +64,14 @@ picks the next configuration to test:
 - **Rounds 2…`2·(D+1)`+1** — a scrambled **Sobol** sequence (space-filling
   exploration), where `D` is the number of optimized dimensions. (Deliberately
   one more than the study memo's `2n+1` rule, as a conservative buffer.)
-- **Remaining rounds** — **GP-based MOBO** (`qLogNEHVI`), which fits a Gaussian
+- **Rounds in between** — **GP-based MOBO** (`qLogNEHVI`), which fits a Gaussian
   process to the two objective scores and proposes the configuration expected to
-  most improve the Pareto front.
+  most improve the Pareto front (rounds 12–16 in the current study).
+- **Final round** — the **baseline re-test**: the anchor design again
+  (`N_RETEST = 1`). With the baseline only in round 1, any baseline-vs-optimized
+  comparison is confounded with what changes over one session (practice,
+  fatigue, the maps). The same design at both ends of the session measures that
+  drift directly. See [Baseline re-test](#baseline-re-test).
 
 Every proposal lies on a **JND-spaced grid**, so no two tested settings are
 closer than one just-noticeable difference.
@@ -187,8 +192,10 @@ Everything study-specific lives in **`space.py`**. To repurpose the service:
    "objectiveScore"]`, both maximized, in `[0,1]`). Add a third for 3 objectives;
    everything downstream adapts automatically.
 3. **Trial budget** — auto-derived: `N_SOBOL = 1 + 2·(D+1)` (one anchor round plus
-   the Sobol draws), `N_TOTAL = space.MAX_ROUND_NUMBER`. Override with the
-   `N_SOBOL` / `N_TOTAL` env vars; `N_MOBO` is derived and read-only.
+   the Sobol draws), `N_RETEST = space.N_RETEST_DEFAULT` (final re-test rounds),
+   `N_TOTAL = space.MAX_ROUND_NUMBER`. Override with the `N_SOBOL` / `N_RETEST` /
+   `N_TOTAL` env vars; `N_MOBO = N_TOTAL − N_SOBOL − N_RETEST` is derived and
+   read-only.
 4. **Hard constraints** — implement `is_feasible(raw)` (returns `False` for
    configs that must never be tested). Applied to Sobol draws and MOBO candidates.
 
@@ -235,9 +242,9 @@ from a different one.
 3. Deploy when no participant is mid-study. If that is impossible, restart the
    affected participants explicitly: delete their `parameterValues/{pid}_step_*`
    and `interventionResults` docs, then re-create `users/{pid}`.
-4. Check `/health` afterwards — it echoes the live `PARAM_NAMES`, `N_SOBOL` and
-   `N_TOTAL`, which is the fastest confirmation that the space you edited is the
-   space that is running.
+4. Check `/health` afterwards — it echoes the live `PARAM_NAMES`, `N_SOBOL`,
+   `N_RETEST` and `N_TOTAL`, which is the fastest confirmation that the space you
+   edited is the space that is running.
 
 If a study is already collecting data and you need a different space for a new
 cohort, prefer deploying a **second Cloud Run service** (same code, different
@@ -251,7 +258,8 @@ All optional; sensible defaults built in. Set on the Cloud Run service with
 | Env var | Default | Meaning |
 |---------|---------|---------|
 | `FIRESTORE_DATABASE` | `(default)` | Firestore database id to use |
-| `N_SOBOL` | `space.N_SOBOL_DEFAULT` = `1 + 2·(D+1)` | non-model rounds: 1 anchor + `2·(D+1)` Sobol draws. The GP takes over on *usable observations*, so `N_MOBO = N_TOTAL − N_SOBOL` is a maximum. |
+| `N_SOBOL` | `space.N_SOBOL_DEFAULT` = `1 + 2·(D+1)` | non-model rounds: 1 anchor + `2·(D+1)` Sobol draws. The GP takes over on *usable observations*, so `N_MOBO = N_TOTAL − N_SOBOL − N_RETEST` is a maximum. |
+| `N_RETEST` | `space.N_RETEST_DEFAULT` (1) | final rounds that re-test the anchor design. Scheduled by round, so discarded rounds never move it. `0` disables it; change it only between participants. |
 | `N_TOTAL` | `space.MAX_ROUND_NUMBER` (17) | total **rounds** before `studyCompleted`. Must match the app's fixed map deck; shorter and longer budgets are rejected. |
 | `NUM_RESTARTS` | `5` | acqf optimizer restarts |
 | `RAW_SAMPLES` | `256` | acqf raw samples |
@@ -597,7 +605,8 @@ on our side at all. `space.rules_valid_burst()` mirrors the predicate and
 - Service writes `parameterValues/{pid}_step_N`: `schemaVersion: 2`, `candidateId`,
   `phase: "exploration"`, `phaseStep`/`roundNumber`, `hapticMode: "burst"`,
   `isFinalRound`, `createdAt`, the 14-cue `haptics` map, and a `mobo` map holding
-  the knob vector, the real optimizer phase and the `spaceVersion`.
+  the knob vector, the real optimizer phase (`anchor` / `sobol` / `mobo` /
+  `sobol-fallback` / `retest`) and the `spaceVersion`.
 - App writes `interventionResults/{id}` echoing the design it rendered, plus
   `pid`, `phaseStep` == `roundNumber`, both objective fields, `touchedTarget`,
   `parameterDocumentId`, `candidateId`, `sessionId`, `mapName`, `authUid`,
@@ -642,6 +651,34 @@ floor is not a protocol timeout.
 Start new participants only after the app and service changes are deployed
 together. Use a fresh test participant for the end-to-end cloud checks before
 collecting study data with a new deployment.
+
+### Baseline re-test
+
+The final `N_RETEST` round(s) (default 1, so round 17) render the anchor design
+again. It is the one deliberate repeat. `main.choose_proposal()` schedules it by
+**round**, before the novelty set is consulted, so a participant whose results
+were discarded still meets the baseline at both ends of the session.
+
+Why: the anchor always comes first, straight after the training phase and on
+the first map. Without a second measurement, everything that changes over one
+session (practice, fatigue, the maps) is confounded with every comparison
+between the baseline and the optimized designs. The difference between round 17
+and round 1 (same design) estimates that drift within each participant, so any
+gain over the anchor can be read against it.
+
+Cost: one model-driven round (rounds 12–16 instead of 12–17).
+
+Analysis: `evaluate_mobo.R` sets the re-test aside before the hypervolume and
+Pareto analyses. Left in, a second noisy draw of the baseline would raise the
+final hypervolume, and the GP would get the credit. Section 7b instead pairs the
+re-test with round 1 and writes `baseline_drift.csv`, with a paired test via
+`colleyRstats::plot_within_stats`. The service's own
+`moboMetrics/{pid}_step_17` hypervolume still includes it.
+
+The app needs no change, because it plays whatever design round 17 carries. It
+is still a protocol change the app team should know about, since participants
+feel the seed design twice. `N_RETEST=0` restores six model-driven rounds;
+change it only between participants.
 
 ### The burst profile (per cue)
 

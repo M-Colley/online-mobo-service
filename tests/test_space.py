@@ -341,11 +341,30 @@ def test_sobol_and_random_are_on_grid_and_feasible():
 
 
 def test_budget_fits_the_rules_round_cap():
-    # anchor + 2*(D+1) Sobol rounds must leave room for at least one GP round.
+    # anchor + 2*(D+1) Sobol rounds + the final re-test must leave room for at
+    # least one GP round.
     assert space.N_SOBOL_DEFAULT == space.N_ANCHOR + 2 * (space.D + 1)
-    assert space.N_SOBOL_DEFAULT < space.MAX_ROUND_NUMBER
+    assert space.N_RETEST_DEFAULT == 1
+    assert space.N_SOBOL_DEFAULT + space.N_RETEST_DEFAULT < space.MAX_ROUND_NUMBER
     assert space.MAX_ROUND_NUMBER == 17
-    assert space.MAX_ROUND_NUMBER - space.N_SOBOL_DEFAULT == 6
+    # rounds 12..16 are model-driven; round 17 re-tests the anchor
+    assert space.MAX_ROUND_NUMBER - space.N_SOBOL_DEFAULT - space.N_RETEST_DEFAULT == 5
+
+
+def test_validator_rejects_a_retest_that_crowds_out_the_gp():
+    saved = space.N_RETEST_DEFAULT
+    try:
+        for bad in (space.MAX_ROUND_NUMBER - space.N_SOBOL_DEFAULT, -1, 1.0, True):
+            space.N_RETEST_DEFAULT = bad
+            try:
+                space._validate()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"validator accepted N_RETEST_DEFAULT={bad!r}")
+    finally:
+        space.N_RETEST_DEFAULT = saved
+    space._validate()  # the real budget still validates
 
 
 def test_validator_catches_bad_space():

@@ -296,13 +296,23 @@ KNOB_NAMES = PARAM_NAMES                 # readable alias: these are knobs, not 
 # ── Round budget (the ONE place these numbers are defined) ───────────────────
 # Round 1 is the anchor (the seed design, a fixed within-participant control).
 # The next 2*(D+1) rounds are Sobol draws — deliberately one more than the study
-# memo's "2n+1" as a conservative buffer (decision 2026-07-21). Everything up to
-# MAX_ROUND_NUMBER is model-driven. main.py reads these; it can be overridden
-# there via env vars, but the default is derived here so simulate.py, the tests
-# and main.py cannot drift apart.
+# memo's "2n+1" as a conservative buffer (decision 2026-07-21). The last
+# N_RETEST_DEFAULT rounds RE-TEST the anchor (below); everything in between is
+# model-driven. main.py reads these; it can be overridden there via env vars,
+# but the default is derived here so simulate.py, the tests and main.py cannot
+# drift apart.
 N_ANCHOR = 1
 N_SOBOL_DRAWS = 2 * (D + 1)
 N_SOBOL_DEFAULT = N_ANCHOR + N_SOBOL_DRAWS   # rounds 1..N_SOBOL_DEFAULT are not model-driven
+
+# The baseline RE-TEST (proposed 2026-11-11; 0 disables it). With the seed design
+# only in round 1, every baseline-vs-optimized comparison is confounded with what
+# changes over one session — practice, fatigue — and the anchor is always the
+# first map played. The same design at both ends of the session measures that
+# drift directly. It is the one deliberate repeat: it bypasses the novelty set,
+# which exists to stop ACCIDENTAL re-issues. Cost: one model-driven round
+# (rounds 12..16 instead of 12..17 at D = 4).
+N_RETEST_DEFAULT = 1
 
 
 # ── Expansion: knob vector  ->  the 70 numbers the app renders ───────────────
@@ -630,7 +640,11 @@ def on_grid(raw: dict) -> bool:
 
 
 def anchor() -> dict:
-    """The seed design as a knob vector: all zeros. Round 1 of every participant."""
+    """The seed design as a knob vector: all zeros.
+
+    Round 1 of every participant, and again in the final N_RETEST_DEFAULT
+    round(s) as the baseline re-test.
+    """
     return {p.name: 0.0 for p in CONT_PARAMS}
 
 
@@ -751,12 +765,15 @@ def _validate() -> None:
         raw = {p.name: float(v) for p, v in zip(CONT_PARAMS, combo)}
         if not is_feasible(raw):
             raise ValueError(f"knob corner {raw} renders an illegal design")
-    # The budget has to fit the rules' round cap, with the anchor round included.
-    if N_SOBOL_DEFAULT >= MAX_ROUND_NUMBER:
+    # The budget has to fit the rules' round cap, with the anchor round and the
+    # baseline re-test included.
+    if type(N_RETEST_DEFAULT) is not int or N_RETEST_DEFAULT < 0:
+        raise ValueError(f"N_RETEST_DEFAULT must be an int >= 0 (got {N_RETEST_DEFAULT!r})")
+    if N_SOBOL_DEFAULT + N_RETEST_DEFAULT >= MAX_ROUND_NUMBER:
         raise ValueError(
             f"budget does not fit: anchor + 2*(D+1) = {N_SOBOL_DEFAULT} non-model rounds "
-            f"leave nothing for the GP inside MAX_ROUND_NUMBER = {MAX_ROUND_NUMBER}. "
-            f"Drop a knob (D={D})."
+            f"plus {N_RETEST_DEFAULT} re-test round(s) leave nothing for the GP inside "
+            f"MAX_ROUND_NUMBER = {MAX_ROUND_NUMBER}. Drop a knob (D={D}) or the re-test."
         )
     # Build the inverse table now (cold start, not a participant's request) and
     # get the injectivity proof for free: one entry per grid point.

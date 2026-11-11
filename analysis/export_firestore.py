@@ -55,8 +55,9 @@ OUT_LONG = os.environ.get("OUT_LONG_CSV", os.path.join(HERE, "trials_haptics_lon
 EXCLUDE_PREFIXES = ("claude_", "test_", "debug_", "sim_", "discard_")
 
 # `phase` is the literal the app's rules require ('exploration' on every round);
-# `optimizerPhase` is the real label (anchor / sobol / mobo / sobol-fallback) and
-# is the one the analysis must split on.
+# `optimizerPhase` is the real label (anchor / sobol / mobo / sobol-fallback /
+# retest) and is the one the analysis must split on. `retest` is the seed design
+# again in the final round(s): a drift measurement, not an optimizer choice.
 COLUMNS = (["pid", "phaseStep", "roundNumber", "phase", "optimizerPhase",
             "attentionCheckPassed", "touchedTarget", "mapName", "sessionId",
             "resultId", "candidateId", "parameterDocumentId", "schemaVersion",
@@ -276,11 +277,13 @@ def main() -> None:
     for pid in pids:
         n = sum(1 for r in rows if r["pid"] == pid)
         opt = sum(1 for r in rows if r["pid"] == pid and r["optimizerPhase"] == "mobo")
-        print(f"    {pid:<24} {n:>3} rounds ({opt} model-driven)")
+        retest = sum(1 for r in rows if r["pid"] == pid and r["optimizerPhase"] == "retest")
+        print(f"    {pid:<24} {n:>3} rounds ({opt} model-driven, {retest} baseline re-test)")
     if any(not r["optimizerPhase"] for r in rows):
         print("\n  NOTE: some rounds have an empty `optimizerPhase` — their parameterValues\n"
               "  doc is missing or predates schemaVersion 2. evaluate_mobo.R falls back to\n"
-              "  the N_SOBOL cutoff for those; check they are not the seeded round 1.")
+              "  the round-number cutoffs (N_SOBOL, N_TOTAL - N_RETEST) for those; check\n"
+              "  they are not the seeded round 1.")
     versions = {r["spaceVersion"] for r in rows if r["spaceVersion"]}
     if len(versions) > 1:
         print(f"\n  WARNING: rounds span multiple spaceVersions {sorted(versions)} — the knob\n"

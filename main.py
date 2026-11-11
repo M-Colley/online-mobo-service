@@ -57,29 +57,34 @@ PROPOSALS = "parameterValues"
 METRICS = "moboMetrics"   # our own bookkeeping; we never write to the app's docs
 
 # ── Trial-budget constants ───────────────────────────────────────────────────
-# Defined once in space.py (N_ANCHOR, N_SOBOL_DEFAULT) so simulate.py, the tests
-# and this service cannot drift apart; overridable here via env vars. Round 1 is
-# the anchor, rounds 2..N_SOBOL are Sobol draws, the rest are GP rounds. N_TOTAL
-# is capped by the current app contract, which rejects roundNumber > 17. N_MOBO
-# is a MAXIMUM: the GP takes over only once N_SOBOL usable observations exist,
-# so every discarded round shortens the model-driven phase by one.
+# Defined once in space.py (N_ANCHOR, N_SOBOL_DEFAULT, N_RETEST_DEFAULT) so
+# simulate.py, the tests and this service cannot drift apart; overridable here
+# via env vars. Round 1 is the anchor, rounds 2..N_SOBOL are Sobol draws, the
+# last N_RETEST rounds re-test the anchor, and the rounds in between are GP
+# rounds. N_TOTAL is capped by the current app contract, which rejects
+# roundNumber > 17. N_MOBO is a MAXIMUM: the GP takes over only once N_SOBOL
+# usable observations exist, so every discarded round shortens the model-driven
+# phase by one. The re-test is fixed by the ROUND, so it never moves.
 N_ANCHOR = space.N_ANCHOR
 N_SOBOL = int(os.environ.get("N_SOBOL", str(space.N_SOBOL_DEFAULT)))
+N_RETEST = int(os.environ.get("N_RETEST", str(space.N_RETEST_DEFAULT)))
 N_TOTAL = int(os.environ.get("N_TOTAL", str(space.MAX_ROUND_NUMBER)))
-N_MOBO = max(0, N_TOTAL - N_SOBOL)
+N_MOBO = max(0, N_TOTAL - N_SOBOL - N_RETEST)
 
-if N_SOBOL < N_ANCHOR or N_TOTAL < 1:
-    raise SystemExit("N_SOBOL must include the anchor and N_TOTAL must be positive")
+if N_SOBOL < N_ANCHOR or N_TOTAL < 1 or N_RETEST < 0:
+    raise SystemExit("N_SOBOL must include the anchor, N_TOTAL must be positive "
+                     "and N_RETEST must not be negative")
 if N_TOTAL != space.MAX_ROUND_NUMBER:
     raise SystemExit(
         f"N_TOTAL={N_TOTAL} must match the app's fixed {space.MAX_ROUND_NUMBER}-round "
         "map deck. A shorter budget leaves the app waiting; a longer budget "
         "writes a candidate the app rejects."
     )
-if N_SOBOL >= N_TOTAL:
+if N_SOBOL + N_RETEST >= N_TOTAL:
     raise SystemExit(
-        f"N_SOBOL={N_SOBOL} leaves no model-driven rounds inside N_TOTAL={N_TOTAL}. "
-        "That is a random-search study wearing a GP label — lower N_SOBOL or drop a knob."
+        f"N_SOBOL={N_SOBOL} plus N_RETEST={N_RETEST} leaves no model-driven rounds "
+        f"inside N_TOTAL={N_TOTAL}. That is a random-search study wearing a GP "
+        "label — lower N_SOBOL or N_RETEST, or drop a knob."
     )
 
 REF_POINT_HV = torch.tensor(core.REF_POINT, dtype=torch.double)
@@ -403,11 +408,17 @@ def choose_proposal(obs_count: int, next_phase_step: int, avoid: set,
 
     The GP takes over on USABLE observations (it needs the data), while the round
     budget and the Sobol pointer follow the ROUND. So a discarded round costs one
-    model-driven round at the end — logged by update_policy — rather than fitting
-    a GP on fewer points than the exploration phase was sized for.
+    model-driven round — logged by update_policy — rather than fitting a GP on
+    fewer points than the exploration phase was sized for. The anchor and its
+    re-test also follow the ROUND: a participant whose results were discarded
+    still meets the baseline at both ends of the session.
     """
     if next_phase_step <= N_ANCHOR:
         return space.anchor(), "anchor"
+    if next_phase_step > N_TOTAL - N_RETEST:
+        # The baseline re-test: the seed design AGAIN, on purpose, so `avoid`
+        # (which stops accidental re-issues) is deliberately not consulted.
+        return space.anchor(), "retest"
     if obs_count < N_SOBOL or X_model is None:
         return exploration_draw(next_phase_step, avoid), "sobol"
     return core.choose_next(X_model, Y, avoid, dedup_seed=next_phase_step), "mobo"
@@ -528,5 +539,5 @@ def health():
                     "cues": len(space.CUES),
                     "database": FIRESTORE_DATABASE,
                     "N_ANCHOR": N_ANCHOR, "N_SOBOL": N_SOBOL,
-                    "N_MOBO": N_MOBO, "N_TOTAL": N_TOTAL,
+                    "N_MOBO": N_MOBO, "N_RETEST": N_RETEST, "N_TOTAL": N_TOTAL,
                     "maxRoundNumber": space.MAX_ROUND_NUMBER})

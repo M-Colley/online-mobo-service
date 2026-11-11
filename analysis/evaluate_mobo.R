@@ -23,6 +23,8 @@
 #   2. Does the MOBO phase beat the Sobol phase, or is the GP earning nothing?
 #   3. Which configurations end up on each participant's Pareto front?
 #   4. How far is each participant's front from the pooled reference front?
+#   5. How much does the unchanged baseline drift between round 1 and its
+#      re-test in the final round (practice, fatigue, maps)?
 #
 # Built on colleyRstats (APA reporting, MOBO plots) and moocore (Pareto/HV/IGD).
 # =============================================================================
@@ -38,21 +40,25 @@ suppressPackageStartupMessages({
 # ── Configuration ────────────────────────────────────────────────────────────
 # MUST stay in sync with the service:
 #   REF_POINT   <- optimizer_core.py  (REF_POINT = [-0.1] * n_objectives)
-#   N_SOBOL     <- main.py / GET /health
+#   N_SOBOL, N_RETEST, N_TOTAL  <- main.py / GET /health
 #   OBJECTIVES  <- space.py OBJECTIVE_FIELDS (both MAXIMISED, in [0, 1])
 OBJECTIVES <- c("subjectiveScore", "objectiveScore")
 REF_POINT  <- c(-0.1, -0.1)
 # Rounds 1..N_SOBOL are not model-driven: round 1 is the ANCHOR (the app team's
 # seed design, an unmodified within-participant control) and rounds 2..N_SOBOL
-# are Sobol draws. N_SOBOL = 1 + 2*(D+1) with D = 4.
+# are Sobol draws. N_SOBOL = 1 + 2*(D+1) with D = 4. The last N_RETEST rounds
+# RE-TEST the anchor (the seed design again, to measure drift); the rounds in
+# between are model-driven.
 N_SOBOL    <- 11
+N_RETEST   <- 1
+N_TOTAL    <- 17
 QUESTIONNAIRE_VERSION <- 2
 PARAMS     <- c("gainIntensity", "gainSharpness", "gainRate", "gainBurstLength")
 
 # WARNING: the app's security rules pin the RESULT doc's `phase` to the literal
 # string "exploration" on every round, so that column says nothing about whether
 # a round was model-driven. Split on `optimizerPhase` (anchor / sobol / mobo /
-# sobol-fallback), which the optimizer records on its own proposal doc.
+# sobol-fallback / retest), which the optimizer records on its own proposal doc.
 
 args    <- commandArgs(trailingOnly = TRUE)
 csv_in  <- if (length(args) >= 1) args[1] else file.path("analysis", "trials.csv")
@@ -144,23 +150,33 @@ if (anyDuplicated(trials[c("pid", "phaseStep")])) {
 
 # `plot_mobo2()` matches the phase column case-insensitively against exactly
 # "sampling" and "optimization" and errors if either is absent. The service
-# writes anchor / sobol / sobol-fallback / mobo in optimizerPhase, so remap.
-# Trials with no phase label (missing parameterValues doc) fall back to the
-# N_SOBOL cutoff.
+# writes anchor / sobol / sobol-fallback / mobo / retest in optimizerPhase, so
+# remap. Trials with no phase label (missing parameterValues doc) fall back to
+# the round-number cutoffs.
 trials <- trials |>
   mutate(
     optimizerPhase = if ("optimizerPhase" %in% names(raw)) {
       as.character(optimizerPhase)
     } else NA_character_,
     Phase = case_when(
+      grepl("^retest", optimizerPhase, ignore.case = TRUE)         ~ "Retest",
       grepl("^mobo", optimizerPhase, ignore.case = TRUE)           ~ "Optimization",
       grepl("^(anchor|sobol)", optimizerPhase, ignore.case = TRUE) ~ "Sampling",
+      phaseStep > N_TOTAL - N_RETEST                               ~ "Retest",
       phaseStep > N_SOBOL                                          ~ "Optimization",
       TRUE                                                         ~ "Sampling"
-    ),
-    Phase = factor(Phase, levels = c("Sampling", "Optimization"))
+    )
   ) |>
   arrange(pid, phaseStep)
+
+# The baseline RE-TEST renders the seed design again. It is not an optimizer
+# choice, so it is set aside before the hypervolume and Pareto analyses — kept
+# in, a second noisy draw of the baseline would raise the final hypervolume and
+# be credited to the GP — and analysed on its own in section 7b.
+retest_rows <- trials |> filter(Phase == "Retest")
+trials <- trials |>
+  filter(Phase != "Retest") |>
+  mutate(Phase = factor(Phase, levels = c("Sampling", "Optimization")))
 
 if (!any(trials$Phase == "Optimization")) {
   warning("no model-driven rounds in the input — every round was labelled ",
@@ -171,6 +187,8 @@ n_anchor <- sum(grepl("^anchor", trials$optimizerPhase, ignore.case = TRUE),
                 na.rm = TRUE)
 cat("anchor (seed-design) rounds:", n_anchor,
     "— the expert baseline, repeated identically for every participant\n")
+cat("baseline re-test rounds:", nrow(retest_rows),
+    "— set aside for the drift check (section 7b)\n")
 
 participants <- sort(unique(trials$pid))
 cat("participants:", length(participants), " trials:", nrow(trials), "\n")
@@ -321,9 +339,14 @@ if (length(participants) >= 3 && min(n_optim_by_pid$n_optim) >= 1) {
   try(print(colleyRstats::report_mean_sd(as.data.frame(phase_gain),
                                          iv = "Phase", dv = "hv_gain_per_trial")),
       silent = TRUE)
+  # `subject` is required: without it colleyRstats refuses to pair rows by
+  # order, and the silent try() used to swallow that error with no output.
   p_phase <- try(colleyRstats::plot_within_stats(
     data = as.data.frame(phase_gain), x = "Phase", y = "hv_gain_per_trial",
-    ylab = "HV gain per trial"), silent = TRUE)
+    ylab = "HV gain per trial", subject = "pid"), silent = TRUE)
+  if (inherits(p_phase, "try-error")) {
+    cat("  (phase comparison failed:", conditionMessage(attr(p_phase, "condition")), ")\n")
+  }
   if (!inherits(p_phase, "try-error")) {
     try(colleyRstats::save_paper_figure(p_phase,
         filename = file.path(out_dir, "phase_gain.pdf"), columns = 1), silent = TRUE)
@@ -376,6 +399,74 @@ if (length(have_params)) {
     cat("\nNOTE: a knob value is an integer JND OFFSET from the seed design, not a\n",
         "stimulus value. The rendered 14-cue designs are in\n",
         "analysis/trials_haptics_long.csv.\n")
+  }
+  cat("\n")
+}
+
+# ── 7b. Baseline drift: anchor (round 1) vs re-test (final round) ────────────
+# Both rounds render the identical seed design, so a difference between them is
+# drift over the session (practice, fatigue, the maps), not design. Read every
+# gain over the anchor against it: a gain no larger than the drift is not
+# evidence for the optimizer. A pair needs the SAME design at both ends, so both
+# rows must decode to all-zero knobs; the app team's hand-seeded round 1 has no
+# phase label but still qualifies through its knobs.
+is_seed_design <- function(d) {
+  if (!all(PARAMS %in% names(d))) return(rep(TRUE, nrow(d)))
+  zero <- rowSums(abs(as.matrix(d[PARAMS])) > 0) == 0
+  !is.na(zero) & zero
+}
+anchor_pts <- trials[trials$phaseStep == 1 & is_seed_design(trials), , drop = FALSE]
+retest_pts <- retest_rows[is_seed_design(retest_rows), , drop = FALSE] |>
+  group_by(pid) |>
+  slice_max(phaseStep, n = 1, with_ties = FALSE) |>
+  ungroup()
+drift <- inner_join(
+  anchor_pts |> select(pid, all_of(OBJECTIVES)),
+  retest_pts |> select(pid, retestStep = phaseStep, all_of(OBJECTIVES)),
+  by = "pid", suffix = c("_anchor", "_retest"))
+for (obj in OBJECTIVES) {
+  drift[[paste0(obj, "_drift")]] <- drift[[paste0(obj, "_retest")]] -
+    drift[[paste0(obj, "_anchor")]]
+}
+
+if (!nrow(drift)) {
+  cat("baseline drift: no participant has both an anchor and a re-test round in\n",
+      "this cohort — skipped. (Data collected with N_RETEST = 0 have none.)\n\n")
+} else {
+  cat("baseline drift (re-test minus anchor; same design, so this is drift):\n")
+  print(as.data.frame(drift), row.names = FALSE)
+  for (obj in OBJECTIVES) {
+    d <- drift[[paste0(obj, "_drift")]]
+    cat(sprintf("  %-16s M = %+.3f, SD = %.3f, n = %d\n", obj, mean(d),
+                if (length(d) > 1) sd(d) else NA_real_, length(d)))
+  }
+  write.csv(drift, file.path(out_dir, "baseline_drift.csv"), row.names = FALSE)
+
+  if (nrow(drift) >= 3) {
+    for (obj in OBJECTIVES) {
+      long <- data.frame(
+        pid = rep(drift$pid, 2),
+        Measurement = factor(rep(c("Anchor", "Re-test"), each = nrow(drift)),
+                             levels = c("Anchor", "Re-test")),
+        value = c(drift[[paste0(obj, "_anchor")]], drift[[paste0(obj, "_retest")]]))
+      names(long)[names(long) == "value"] <- obj
+      cat("--- APA report: baseline drift in", obj, "(anchor vs re-test) ---\n")
+      p_drift <- try(colleyRstats::plot_within_stats(
+        data = long, x = "Measurement", y = obj, ylab = obj, subject = "pid"),
+        silent = TRUE)
+      if (inherits(p_drift, "try-error")) {
+        cat("  (drift test failed:", conditionMessage(attr(p_drift, "condition")), ")\n")
+      } else {
+        try(colleyRstats::save_paper_figure(p_drift,
+            filename = file.path(out_dir, paste0("baseline_drift_", obj, ".pdf")),
+            columns = 1), silent = TRUE)
+        try(invisible(colleyRstats::report_ggstatsplot(p_drift, iv = "Measurement",
+            dv = obj)), silent = TRUE)
+      }
+    }
+  } else {
+    cat("(skipping the inferential drift test: needs >= 3 participants with both\n",
+        "rounds; have", nrow(drift), ")\n")
   }
   cat("\n")
 }

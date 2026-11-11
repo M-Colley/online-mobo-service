@@ -26,7 +26,9 @@ The optimizer therefore searches **four integer JND knobs** (`gainIntensity`,
 `gainSharpness`, `gainRate`, `gainBurstLength`) that are offsets from the app
 team's seed design; `space.expand()` turns a knob vector into all 70 numbers.
 Knobs all zero **is** the seed design. Round 1 is that anchor, rounds 2–11 are
-Sobol (`2·(D+1)` draws), rounds 12–17 are GP `qLogNEHVI`.
+Sobol (`2·(D+1)` draws), rounds 12–16 are GP `qLogNEHVI`, and round 17
+re-tests the anchor (`N_RETEST = 1`, proposed 2026-11-11, not yet agreed with
+the app team).
 
 ## Ground rules
 
@@ -42,7 +44,7 @@ Sobol (`2·(D+1)` draws), rounds 12–17 are GP `qLogNEHVI`.
    ```bash
    python space.py              # print resolved grids — eyeball the level counts
    python tests/test_space.py   # search-space unit tests (~5 s: exhaustive rules pass)
-   python simulate.py           # offline loop: on-grid, unique, hypervolume rises
+   python simulate.py           # offline loop: on-grid, unique but for the re-test, HV rises
    python tests/test_service.py # full HTTP service vs an in-memory Firestore fake
    ```
    Or `make test` / `.\tasks.ps1 test` for all four. `_validate()` runs on import
@@ -51,7 +53,8 @@ Sobol (`2·(D+1)` draws), rounds 12–17 are GP `qLogNEHVI`.
 3. **`2·(D+1)` Sobol draws is a deliberate decision**, one more than the study
    memo's `2n+1`. It is not an off-by-one bug — do not "fix" it. The constant
    `N_SOBOL` counts the anchor round too (`space.N_SOBOL_DEFAULT = N_ANCHOR +
-   2·(D+1)` = 11): rounds 1–11 are not model-driven. `N_MOBO` is a *maximum* —
+   2·(D+1)` = 11): rounds 1–11 are not model-driven, and neither are the last
+   `N_RETEST` rounds. `N_MOBO = N_TOTAL − N_SOBOL − N_RETEST` is a *maximum* —
    the GP takes over on usable observations, so every discarded round shortens
    the model phase by one (logged as `has N rounds but only M usable observations`).
 4. **Never deploy `firestore:rules`.** The app team owns the live security rules
@@ -181,6 +184,12 @@ maximum-intensity defaults apply to local practice only.
   separately from the training-set size. Conflating them desynchronises the
   counter the moment a round is discarded, and the service then re-proposes a
   step whose doc already exists — `{"skipped": true}` forever.
+- **Round 17 is the seed design again, on purpose.** It is the baseline re-test,
+  the one deliberate repeat, so do not "fix" the novelty check to catch it.
+  `choose_proposal()` schedules it by round before consulting `avoid`.
+  `evaluate_mobo.R` keeps it out of the hypervolume and Pareto analyses (it would
+  inflate the final HV) and pairs it with round 1 for the drift check. To turn
+  it off, set `N_RETEST=0`, between participants and never mid-study.
 
 ## Settled with the app team
 
