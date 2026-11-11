@@ -133,6 +133,24 @@ class ExportContractTests(unittest.TestCase):
         self.assertEqual(skipped, 0)
         self.assertEqual(rows[0]["optimizerPhase"], "anchor")
 
+    def test_retest_round_keeps_its_label_and_the_baseline_knobs(self):
+        # evaluate_mobo.R sets the re-test aside by this label; losing it would
+        # count a second draw of the seed design as a model-driven round.
+        step = space.MAX_ROUND_NUMBER
+        proposal = {**self.proposal, "phaseStep": step,
+                    "mobo": {"phase": "retest", "spaceVersion": space.SPACE_VERSION}}
+        result = {**self.current, "phaseStep": step, "roundNumber": step,
+                  "parameterDocumentId": "candidate-retest",
+                  "resultId": "session-one-round-17"}
+        with contextlib.redirect_stdout(io.StringIO()):
+            rows, _, skipped, _ = build_rows(
+                [("retest", result)], {"candidate-retest": proposal},
+                {("001", step): proposal}, {})
+        self.assertEqual(skipped, 0)
+        self.assertEqual(rows[0]["optimizerPhase"], "retest")
+        self.assertEqual({k: rows[0][k] for k in space.KNOB_NAMES},
+                         {k: 0 for k in space.KNOB_NAMES})
+
     def test_failed_attention_round_keeps_its_own_haptic_join_identity(self):
         failed = {**self.current, "attentionCheckPassed": False,
                   "resultId": "failed-round-1"}

@@ -12,8 +12,9 @@ hidden favourite knob setting, and asserts:
   • every proposed knob vector lies on the JND grid,
   • every proposal EXPANDS to a design the app's security rules accept
     (an illegal design would stall the participant with no error on our side),
-  • no configuration is proposed twice,
-  • round 1 is the anchor (the app team's seed design),
+  • no configuration is proposed twice, except the planned re-test,
+  • round 1 is the anchor (the app team's seed design), and the final
+    N_RETEST round(s) re-test it,
   • the run completes and the hypervolume is non-decreasing.
 """
 
@@ -30,6 +31,7 @@ np.random.seed(0)
 
 N_ANCHOR = space.N_ANCHOR
 N_SOBOL = space.N_SOBOL_DEFAULT          # anchor + 2*(D+1) Sobol draws
+N_RETEST = space.N_RETEST_DEFAULT        # final round(s): the anchor again
 N_TOTAL = space.MAX_ROUND_NUMBER         # the current app caps rounds at 17
 
 
@@ -68,7 +70,7 @@ def _hv(Y: torch.Tensor) -> float:
 def main() -> None:
     print(space.describe())
     print(f"\nBudget: {N_ANCHOR} anchor + {N_SOBOL - N_ANCHOR} Sobol + "
-          f"{N_TOTAL - N_SOBOL} MOBO = {N_TOTAL} rounds")
+          f"{N_TOTAL - N_SOBOL - N_RETEST} MOBO + {N_RETEST} re-test = {N_TOTAL} rounds")
     print(f"Hidden favourite: {_FAVOURITE}\n")
 
     history: list[dict] = []
@@ -81,6 +83,10 @@ def main() -> None:
         if step <= N_ANCHOR:
             raw = space.anchor()
             phase = "anchor"
+        elif step > N_TOTAL - N_RETEST:
+            # the baseline re-test, scheduled by ROUND as in main.choose_proposal
+            raw = space.anchor()
+            phase = "retest"
         elif obs_count < N_SOBOL:
             # indexed by the ROUND, exactly as main.choose_proposal does
             raw = space.sobol_next(step - N_ANCHOR - 1)
@@ -94,12 +100,17 @@ def main() -> None:
             phase = "mobo"
 
         assert _on_grid(raw), f"OFF-GRID candidate proposed: {raw}"
-        assert space.obs_key(raw) not in observed_keys, f"DUPLICATE proposed: {raw}"
+        if phase == "retest":
+            # the one planned repeat: it must be the anchor, and nothing else
+            assert raw == space.anchor() and space.obs_key(raw) in observed_keys, \
+                f"the re-test is not the anchor: {raw}"
+        else:
+            assert space.obs_key(raw) not in observed_keys, f"DUPLICATE proposed: {raw}"
         haptics = space.expand(raw)
         assert space.rules_valid_haptics(haptics), \
             f"ILLEGAL design (the app could not echo it): {raw} -> {haptics}"
-        if step == 1:
-            assert haptics == space.SEED_DESIGN, "round 1 must be the anchor (seed design)"
+        if step == 1 or phase == "retest":
+            assert haptics == space.SEED_DESIGN, f"round {step} must be the seed design"
 
         y = _rate(raw)
         history.append(raw)
@@ -116,8 +127,9 @@ def main() -> None:
 
     assert all(b >= a - 1e-9 for a, b in zip(hv_curve, hv_curve[1:])), \
         "hypervolume decreased — MOBO not improving"
-    print(f"\nPASS: {N_TOTAL} rounds, all on-grid, all unique, every design legal "
-          f"under the app's rules, hypervolume non-decreasing (final {hv_curve[-1]:.4f}).")
+    print(f"\nPASS: {N_TOTAL} rounds, all on-grid, unique apart from the planned "
+          f"re-test, every design legal under the app's rules, hypervolume "
+          f"non-decreasing (final {hv_curve[-1]:.4f}).")
 
 
 if __name__ == "__main__":

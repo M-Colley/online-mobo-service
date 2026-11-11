@@ -20,7 +20,8 @@ and asserts the things that would otherwise stall a real participant SILENTLY:
   • every proposal's haptics map passes the rules mirror, with pulseCount a real
     int and exactly 5 keys x 14 cues,
   • no proposal exceeds roundNumber 17,
-  • round 1 is the anchor (the app team's seed design),
+  • round 1 is the anchor (the app team's seed design), and the final round
+    re-tests it — the one deliberate repeat, scheduled by round,
   • steps are contiguous, duplicate deliveries are suppressed, and a round whose
     result is unusable is excluded from training but still consumes its round
     (the app has no attention checks since 2026-09-17; results omit the field),
@@ -242,6 +243,8 @@ def run() -> None:
     assert r["ok"] and r["space"] == space.PARAM_NAMES
     assert r["schemaVersion"] == 2 and r["cues"] == 14
     assert r["N_TOTAL"] == space.MAX_ROUND_NUMBER == 17
+    assert r["N_RETEST"] == space.N_RETEST_DEFAULT == 1
+    assert r["N_MOBO"] == r["N_TOTAL"] - r["N_SOBOL"] - r["N_RETEST"] == 5
     assert r["questionnaireVersion"] == space.QUESTIONNAIRE_VERSION == 2
 
     # a missing userId is a client error, not a write against a default pid
@@ -269,7 +272,12 @@ def run() -> None:
         _assert_proposal_is_sane(doc, step, f"step_{step}")
         knobs = {k: float(v) for k, v in doc["mobo"]["knobs"].items()}
         key = space.obs_key(knobs)
-        assert key not in seen, f"step_{step}: duplicate design {knobs}"
+        if doc["mobo"]["phase"] == "retest":
+            # the one planned repeat: the seed design again, nothing else
+            assert knobs == space.anchor() and key in seen, f"step_{step}: re-test {knobs}"
+            assert doc["haptics"] == space.SEED_DESIGN, f"step_{step}: re-test is not the seed"
+        else:
+            assert key not in seen, f"step_{step}: duplicate design {knobs}"
         seen.add(key)
 
         subj, obj = _rate(knobs)
@@ -288,7 +296,9 @@ def run() -> None:
         assert r["obsCount"] == step, f"obsCount {r['obsCount']} != {step}"
         nxt = fake.collection("parameterValues")._store.get(f"{uid}_step_{step + 1}")
         assert nxt is not None, f"step_{step + 1} not written"
-        expected = "sobol" if step + 1 <= main.N_SOBOL else "mobo"
+        expected = ("sobol" if step + 1 <= main.N_SOBOL
+                    else "retest" if step + 1 > main.N_TOTAL - main.N_RETEST
+                    else "mobo")
         assert nxt["mobo"]["phase"] == expected, \
             f"step {step + 1}: optimizer phase {nxt['mobo']['phase']} != {expected}"
         assert nxt["isFinalRound"] == (step + 1 >= main.N_TOTAL)
@@ -320,6 +330,10 @@ def run() -> None:
     # the last proposal must have told the app it was the last one
     final = fake.collection("parameterValues")._store[f"{uid}_step_{main.N_TOTAL}"]
     assert final["isFinalRound"] is True, "retain the final-round flag for compatible consumers"
+    # ...and it is the baseline re-test: the seed design, labelled for the analysis
+    assert final["mobo"]["phase"] == "retest", final["mobo"]
+    assert final["haptics"] == space.SEED_DESIGN, "the re-test must render the seed design"
+    assert final["candidateId"].startswith(f"{uid}-round-{main.N_TOTAL:02d}-retest-")
 
     # never propose past the rules' cap
     assert f"{uid}_step_{main.N_TOTAL + 1}" not in fake.collection("parameterValues")._store
@@ -339,8 +353,32 @@ def run() -> None:
 
     print(f"\nPASS: full HTTP loop, {main.N_TOTAL} rounds "
           f"({main.N_ANCHOR} anchor + {main.N_SOBOL - main.N_ANCHOR} Sobol + "
-          f"{main.N_TOTAL - main.N_SOBOL} MOBO), every design legal under the app's "
-          f"rules, duplicates suppressed, studyCompleted set.")
+          f"{main.N_MOBO} MOBO + {main.N_RETEST} re-test), every design legal under "
+          f"the app's rules, duplicates suppressed, studyCompleted set.")
+
+
+def run_retest_follows_the_round_not_the_observations() -> None:
+    """The re-test is scheduled by ROUND, like the anchor.
+
+    A participant whose results were mostly discarded (obs_count far below
+    N_SOBOL, no model inputs) must still meet the seed design in the final round,
+    even though the anchor is in the novelty set — and N_RETEST=0 must hand that
+    round back to the optimizer.
+    """
+    avoid = {space.obs_key(space.anchor())}
+    last = main.N_TOTAL
+    knobs, phase = main.choose_proposal(2, last, avoid, None, None)
+    assert (phase, knobs) == ("retest", space.anchor()), (phase, knobs)
+    knobs, phase = main.choose_proposal(2, last - 1, avoid, None, None)
+    assert phase == "sobol" and space.obs_key(knobs) not in avoid, (phase, knobs)
+    saved = main.N_RETEST
+    try:
+        main.N_RETEST = 0
+        knobs, phase = main.choose_proposal(2, last, avoid, None, None)
+        assert phase == "sobol" and space.obs_key(knobs) not in avoid, (phase, knobs)
+    finally:
+        main.N_RETEST = saved
+    print("PASS: the baseline re-test is scheduled by round and N_RETEST=0 disables it.")
 
 
 def run_discarded_round_keeps_the_counter() -> None:
@@ -631,6 +669,7 @@ def run_foreign_proposals_do_not_suppress_current_study() -> None:
 
 if __name__ == "__main__":
     run()
+    run_retest_follows_the_round_not_the_observations()
     run_discarded_round_keeps_the_counter()
     run_unusable_results_never_pin_the_design()
     run_foreign_schema_docs_do_not_move_the_counter()
